@@ -23,6 +23,7 @@
  */
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -47,6 +48,7 @@
 #include "cJSON.h"
 #include "ndw_button.h"
 #include "ndw_contract.h"
+#include "ndw_scan.h"
 #include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
@@ -776,6 +778,22 @@ static void ndw_advertise(void)
     }
 }
 
+/*
+ * A beacon arrived.
+ *
+ * Logged and shown on the light for now. This is where MQTT publication goes
+ * once the uplink exists — the router has the frame, its own EUI and the RSSI
+ * it heard it at, which is everything a gateway contributes to a reading.
+ */
+static void on_frame(const ndw_frame_t *frame)
+{
+    ESP_LOGI(TAG, "beacon %s kind %u count %" PRIu32 " rssi %d", frame->eui, frame->kind,
+             frame->counter, frame->rssi);
+    /* One pulse per frame, overlaid on whatever the light is showing, so a
+       relaying router still reads as online between beacons. */
+    ndw_status_pulse();
+}
+
 static void on_host_sync(void)
 {
     ESP_ERROR_CHECK(ble_hs_util_ensure_addr(0));
@@ -785,6 +803,13 @@ static void on_host_sync(void)
      * a stranger with a laptop in the car park. That is the whole point of
      * the window, and it costs physical access to recover a box.
      */
+    /*
+     * Scanning starts here and never stops. Advertising is the exceptional
+     * state — a two-minute pairing window — while listening is what the box
+     * is for, so the two share the radio with listening as the default.
+     */
+    ndw_scan_start(on_frame);
+
     ESP_LOGI(TAG, "ready — hold the button for 3s to pair");
     ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
     ndw_status_set(resting);
