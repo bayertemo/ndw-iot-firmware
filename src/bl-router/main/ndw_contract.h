@@ -40,11 +40,19 @@
 #define NDW_STATUS_UUID NDW_UUID128(0x04)
 
 /*
- * Status values pushed on the notify characteristic.
+ * What the status characteristic carries.
  *
- * Single ASCII words rather than a numeric code: the console shows these to a
- * person, and a string that is already readable cannot be mistranslated by a
- * lookup table that drifts out of sync.
+ * JSON rather than a bare word, because the console needs more than the
+ * outcome: which network the box is on, what address it got, how strong the
+ * signal is, and the WiFi MAC — none of which the cloud can know before the
+ * box has ever transmitted.
+ *
+ *   {"state":"connected","ssid":"Riser-2","ip":"10.0.0.42",
+ *    "mac":"ac:a7:04:be:de:e0","rssi":-52}
+ *
+ * `state` keeps the same words it always had, so the meaning of the field is
+ * unchanged — it moved from being the whole payload to being one key of it.
+ * Read it for current state, subscribe for changes; both give the same shape.
  */
 #define NDW_STATUS_CONNECTING "connecting"
 #define NDW_STATUS_CONNECTED  "connected"

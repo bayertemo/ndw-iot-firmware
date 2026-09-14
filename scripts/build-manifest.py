@@ -96,7 +96,12 @@ def load(build_file: pathlib.Path) -> dict[str, object]:
 
         binary = build_file.parent / str(part["path"])
         entry: dict[str, object] = {
-            "path": f"{expected_kind}/{part['path']}",
+            # Relative to the repository root, because that is what the
+            # console appends to the raw.githubusercontent base. It published
+            # "ndw/..." while the files live under "builds/ndw/...", so every
+            # download 404'd — the manifest was internally consistent and
+            # externally wrong, which is the worst combination.
+            "path": f"{BUILDS.name}/{expected_kind}/{part['path']}",
             "address": address,
         }
 
@@ -161,6 +166,21 @@ def main() -> None:
         )
         + "\n"
     )
+
+    # Every published path must resolve from the repository root. The console
+    # appends these to a raw.githubusercontent base, so a path that is right
+    # relative to anything else is a 404 in a technician's browser — which is
+    # exactly what happened when these were emitted without the builds/
+    # prefix.
+    for build in builds:
+        if not build["published"]:
+            continue
+        for part in build["parts"]:
+            if not (ROOT / str(part["path"])).is_file():
+                fail(
+                    f"{build['kind']}: publishes {part['path']!r}, which does "
+                    f"not exist relative to the repository root"
+                )
 
     ready = sum(1 for b in builds if b["published"])
     print(f"manifest.json: {len(builds)} builds, {ready} with binaries")
