@@ -1,11 +1,14 @@
 name: Build firmware
 
-# Every push builds. What differs is what the build is called and whether it
-# is committed:
+# Builds the firmware and publishes the manifest the console reads. Both live
+# here rather than in two workflows: they fire on the same paths and write the
+# same file, so as separate workflows they raced to commit manifest.json.
+#
+# What differs is what a build is called and whether it is committed:
 #
 #   main          → x.y.z            committed, and the console offers it
-#   pull request  → x.y.z-rc.<n>+sha built and attached to the run, never
-#                                    committed to main
+#   anywhere else → x.y.z-rc.<n>+sha built and attached to the run, never
+#                                    committed
 #
 # The -rc suffix is not cosmetic. The console reads one manifest and offers
 # whatever is in it, so an unreviewed build reaching main is a build a
@@ -31,6 +34,18 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+# Publishing runs commit to main, so two overlapping ones would race on the
+# same ref. Serialised per branch — and deliberately without
+# cancel-in-progress: a run that is part-way through pushing a build should
+# finish, not be killed leaving the manifest describing binaries that were
+# never committed.
+#
+# This does not remove the need for the rebase in the publish step: the jobs
+# within one run are a matrix and still push in parallel.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   # Pinned, not release-vX or latest: a toolchain that moves on its own turns
@@ -213,10 +228,34 @@ jobs:
             echo "nothing changed"
             exit 0
           fi
+
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add builds manifest.json
           git commit -m "Publish ${{ matrix.build }} ${{ steps.version.outputs.version }}"
+
+          # Matrix jobs run in parallel and each pushes its own commit, so the
+          # second one to finish finds a moved ref. Rebase onto it rather than
+          # forcing: the other job's commit is a sibling chip's build, not
+          # something to overwrite.
+          #
+          # manifest.json is the only file both jobs touch, and it is derived
+          # from builds/ — so it is regenerated after the rebase rather than
+          # merged, because a textual merge of two machine-written JSON
+          # documents is exactly the wrong way to resolve this.
+          git fetch origin main
+          if ! git rebase origin/main; then
+            git checkout --theirs manifest.json 2>/dev/null || true
+            python3 scripts/build-manifest.py
+            git add manifest.json
+            GIT_EDITOR=true git rebase --continue
+          fi
+          python3 scripts/build-manifest.py
+          if ! git diff --quiet manifest.json; then
+            git add manifest.json
+            git commit --amend --no-edit
+          fi
+
           git push
 
       - name: Say what was built
