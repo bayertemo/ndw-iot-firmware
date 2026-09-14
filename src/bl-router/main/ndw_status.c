@@ -51,7 +51,15 @@ static volatile ndw_led_t s_status = NDW_LED_IDLE;
  * one be shown in turn, and caps the backlog so a flood does not leave the
  * LED blinking for a minute after the traffic stopped.
  */
-#define PULSE_MAX 3
+/*
+ * At most one pulse queued.
+ *
+ * A deeper backlog made the light lag the radio: beacons arrive faster than
+ * 160ms per blink, so the queue stayed full and the LED reported traffic that
+ * had already gone. One means it always shows "a frame just arrived", which
+ * is the only thing a person can act on.
+ */
+#define PULSE_MAX 1
 static volatile uint8_t s_pulses;
 
 /* 0-100, how far through the hold. Drives the accelerating blink. */
@@ -138,6 +146,15 @@ static void status_task(void *arg)
     uint32_t phase = 0;
     /* Counts down the remaining ticks of an in-flight pulse. */
     uint8_t pulse_ticks = 0;
+    /*
+     * Forced dark ticks after a pulse.
+     *
+     * Without this a router relaying steadily just glowed: beacons arrive
+     * every ~150ms, each pulse lit the LED for 60ms, and the next pulse
+     * started before the eye saw it go out. A blink needs the gap more than
+     * it needs the light.
+     */
+    uint8_t pulse_gap = 0;
 
     for (;;) {
         ndw_led_t now = s_status;
@@ -150,11 +167,19 @@ static void status_task(void *arg)
         if (pulse_ticks > 0) {
             pulse_ticks--;
             show(BLUE);
+        } else if (pulse_gap > 0) {
+            /* Held dark so the pulse just shown has an edge to be seen
+               against. Rendering the underlying state here would light the
+               LED again on the very next tick for an online router. */
+            pulse_gap--;
+            show(OFF);
         } else if (s_pulses > 0) {
             s_pulses--;
-            /* 60ms: long enough to register, short enough to count six a
-               second without them merging into one. */
+            /* 60ms lit, 100ms dark. Slow enough to count by eye at roughly
+               six a second, which is about as fast as a blink still reads as
+               separate events rather than a flicker. */
             pulse_ticks = 60 / TICK_MS;
+            pulse_gap = 100 / TICK_MS;
             show(BLUE);
         } else {
             show(frame_for(showing, phase));
