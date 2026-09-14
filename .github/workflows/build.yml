@@ -109,9 +109,10 @@ jobs:
               set -euo pipefail
               . $IDF_PATH/export.sh >/dev/null
               idf.py set-target ${{ matrix.target }}
-              # The version reaches the firmware as a define rather than a
-              # generated header, so nothing in the tree changes per build.
-              idf.py -DNDW_VERSION="\"${NDW_VERSION}\"" build
+              # Plain, unquoted. main/CMakeLists.txt turns this CMake variable
+              # into the compiler define and adds the quotes; passing them
+              # here too would embed them in the string.
+              idf.py -DNDW_VERSION="${NDW_VERSION}" build
             '
 
       - name: Collect the images
