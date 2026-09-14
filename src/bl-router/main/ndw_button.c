@@ -62,8 +62,16 @@ static void button_task(void *arg)
             if (held > 0 && !fired) {
                 ESP_LOGI(TAG, "released after %dms, too short", held * POLL_MS);
                 /* Back to whatever the box was showing before the press. */
-                ndw_status_hold_progress(0);
                 ndw_status_set(s_idle_state);
+            }
+            if (held > 0) {
+                /*
+                 * On every release, not only an abandoned one. Guarding this
+                 * with !fired left the progress pinned at 100 after a
+                 * successful hold — stale state waiting to mislead whatever
+                 * read it next.
+                 */
+                ndw_status_hold_progress(0);
             }
             held = 0;
             fired = false;

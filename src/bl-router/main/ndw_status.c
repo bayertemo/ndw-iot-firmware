@@ -217,8 +217,30 @@ void ndw_status_init(void)
     ESP_LOGI(TAG, "status LED on GPIO%d", LED_GPIO);
 }
 
+static const char *led_name(ndw_led_t s)
+{
+    switch (s) {
+    case NDW_LED_HOLDING: return "holding";
+    case NDW_LED_PAIRING: return "pairing";
+    case NDW_LED_LINKED:  return "linked";
+    case NDW_LED_JOINING: return "joining";
+    case NDW_LED_ONLINE:  return "online";
+    case NDW_LED_FAILED:  return "failed";
+    default:              return "idle";
+    }
+}
+
 void ndw_status_set(ndw_led_t status)
 {
+    /*
+     * Logged because the LED is the only thing this box can say without a
+     * cable, which makes "it did not blink" impossible to diagnose otherwise
+     * — there is no way to tell a state that was never set from one that was
+     * set and not rendered.
+     */
+    if (status != s_status) {
+        ESP_LOGI(TAG, "led -> %s", led_name(status));
+    }
     s_status = status;
 }
 
