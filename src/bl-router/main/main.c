@@ -22,6 +22,7 @@
  * enough to prove that path against real silicon.
  */
 
+#include <ctype.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -86,6 +87,9 @@ static EventGroupHandle_t s_wifi_events;
 #define WIFI_FAILED BIT1
 
 static char s_eui[NDW_EUI_LEN + 1];
+
+/* What this box calls itself on the network. Defaults to the EUI suffix. */
+static char s_hostname[33];
 static uint16_t s_status_handle;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static int s_join_attempts;
@@ -156,6 +160,53 @@ static void ndw_derive_eui(void)
              mac[4], mac[5]);
 
     ESP_LOGI(TAG, "eui %s", s_eui);
+    /* Until a label arrives, the last six of the EUI — the same suffix the
+       BLE advertisement uses, so the two agree. */
+    snprintf(s_hostname, sizeof(s_hostname), "NDW-%s", s_eui + NDW_EUI_LEN - 6);
+}
+
+/*
+ * What this box calls itself on the network.
+ *
+ * Defaults to the last six of the EUI, so an unnamed box is still
+ * identifiable rather than appearing as "espressif". A label supplied at
+ * provisioning replaces it: DHCP tables and router UIs are where people
+ * actually look for a device, and "NDW-basement-riser" is findable in a way
+ * that a hex identifier is not.
+ */
+/*
+ * DHCP hostnames are not free text. RFC 1123 allows letters, digits and
+ * hyphens, and nothing else — a label with a space or an apostrophe would be
+ * rejected or silently mangled by the router, so it is folded here rather
+ * than trusted.
+ */
+static void ndw_set_hostname(const char *label)
+{
+    size_t out = 0;
+    out += (size_t)snprintf(s_hostname, sizeof(s_hostname), "NDW-");
+
+    bool last_was_dash = true;
+    for (const char *c = label; *c != '\0' && out < sizeof(s_hostname) - 1; c++) {
+        if (isalnum((unsigned char)*c)) {
+            s_hostname[out++] = (char)tolower((unsigned char)*c);
+            last_was_dash = false;
+        } else if (!last_was_dash) {
+            /* Runs of punctuation collapse to one hyphen rather than
+               producing "a--b" or a trailing dash. */
+            s_hostname[out++] = '-';
+            last_was_dash = true;
+        }
+    }
+    while (out > 0 && s_hostname[out - 1] == '-') {
+        out--;
+    }
+    s_hostname[out] = '\0';
+
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_set_hostname(netif, s_hostname);
+    }
+    ESP_LOGI(TAG, "hostname %s", s_hostname);
 }
 
 /* -------------------------------------------------------------------- wifi */
@@ -188,9 +239,27 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * failure reads the same to a technician, who then re-types a
          * password that was correct.
          */
+        /*
+         * Keep the most specific reason across attempts, not the last one.
+         *
+         * A first attempt often reports NO_AP_FOUND simply because the scan
+         * has not settled, and a later one then reports the real problem. The
+         * log that prompted this read "reason 201, retry 1" followed by
+         * "reason 15" — no-such-network followed by wrong-passphrase — and
+         * reporting whichever arrived last would have sent a technician to
+         * check the wrong thing.
+         *
+         * An auth failure is evidence the AP was found and answered, so it
+         * outranks not-found however the attempts are ordered.
+         */
         switch (ev->reason) {
         case WIFI_REASON_NO_AP_FOUND:
-            s_last_failure = NDW_STATUS_NOT_FOUND;
+            /* strcmp, not pointer comparison: these are string literals and
+               the compiler is right that comparing their addresses is
+               unspecified. */
+            if (strcmp(s_last_failure, NDW_STATUS_BAD_AUTH) != 0) {
+                s_last_failure = NDW_STATUS_NOT_FOUND;
+            }
             break;
         case WIFI_REASON_AUTH_FAIL:
         case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
@@ -198,7 +267,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             s_last_failure = NDW_STATUS_BAD_AUTH;
             break;
         default:
-            s_last_failure = NDW_STATUS_FAILED;
+            /* Only when nothing more specific has been seen. */
+            if (strcmp(s_last_failure, NDW_STATUS_NOT_FOUND) != 0 &&
+                strcmp(s_last_failure, NDW_STATUS_BAD_AUTH) != 0) {
+                s_last_failure = NDW_STATUS_FAILED;
+            }
             break;
         }
 
@@ -276,6 +349,15 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
      * for the first time. Aborting the whole board over it would turn "no
      * network yet" into a reboot loop.
      */
+    /*
+     * Re-applied here because esp_netif_set_hostname only sticks while the
+     * interface exists, and the name may have been set before it came up.
+     */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_set_hostname(netif, s_hostname);
+    }
+
     s_reconfiguring = true;
     esp_wifi_disconnect();
 
@@ -458,6 +540,12 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
 
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(doc, "ssid");
     const cJSON *pass = cJSON_GetObjectItemCaseSensitive(doc, "password");
+    /*
+     * Optional. The label is a cloud attribute the box has no need for, with
+     * one exception: it makes a far better DHCP hostname than a hex EUI, so
+     * a router shows up on the network as something a person recognises.
+     */
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
 
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0' || !cJSON_IsString(pass)) {
         ESP_LOGW(TAG, "provisioning payload missing ssid or password");
@@ -469,6 +557,9 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     char pass_buf[PASS_MAX];
     strlcpy(ssid_buf, ssid->valuestring, sizeof(ssid_buf));
     strlcpy(pass_buf, pass->valuestring, sizeof(pass_buf));
+    if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
+        ndw_set_hostname(name->valuestring);
+    }
     cJSON_Delete(doc);
 
     strlcpy(s_ssid, ssid_buf, sizeof(s_ssid));
@@ -550,6 +641,14 @@ static int on_gap_event(struct ble_gap_event *event, void *arg)
          */
         if (s_pairing_open) {
             ndw_advertise();
+        } else if (ndw_status_get() == NDW_LED_FAILED) {
+            /*
+             * Hold a failure on the light after the console goes away. The
+             * console disconnects the moment provisioning finishes, and
+             * dropping straight to idle threw away the one signal a
+             * technician standing at the box could still read.
+             */
+            ESP_LOGI(TAG, "holding the failure on the light");
         } else {
             ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
         }

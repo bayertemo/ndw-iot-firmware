@@ -57,6 +57,9 @@ void ndw_status_init(void);
 /** Switches the light to a state. Takes effect on the next tick. */
 void ndw_status_set(ndw_led_t status);
 
+/** What the light is showing now. */
+ndw_led_t ndw_status_get(void);
+
 /** How far through a button hold, 0-100. Drives the accelerating blink. */
 void ndw_status_hold_progress(uint8_t percent);
 

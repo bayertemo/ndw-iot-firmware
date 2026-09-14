@@ -244,6 +244,11 @@ void ndw_status_set(ndw_led_t status)
     s_status = status;
 }
 
+ndw_led_t ndw_status_get(void)
+{
+    return s_status;
+}
+
 void ndw_status_hold_progress(uint8_t percent)
 {
     s_hold_percent = percent > 100 ? 100 : percent;
