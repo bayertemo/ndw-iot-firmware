@@ -462,7 +462,9 @@ static void ndw_pairing_close(void)
 
     ble_gap_adv_stop();
     ESP_LOGI(TAG, "pairing window closed");
-    ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
+    ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
+    ndw_status_set(resting);
+    ndw_button_set_idle_state(resting);
 }
 
 static void on_pairing_timeout(TimerHandle_t timer)
@@ -562,8 +564,10 @@ static void on_host_sync(void)
      * a stranger with a laptop in the car park. That is the whole point of
      * the window, and it costs physical access to recover a box.
      */
-    ESP_LOGI(TAG, "ready — hold the button for 5s to pair");
-    ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
+    ESP_LOGI(TAG, "ready — hold the button for 3s to pair");
+    ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
+    ndw_status_set(resting);
+    ndw_button_set_idle_state(resting);
 }
 
 static void on_host_reset(int reason)

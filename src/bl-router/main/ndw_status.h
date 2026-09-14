@@ -24,10 +24,21 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
     /* Nothing to report. Provisioned and running, or waiting for a button. */
     NDW_LED_IDLE,
+    /*
+     * The button is down and the hold is counting. Blinks faster as it
+     * approaches the threshold, so the press is visibly progressing.
+     *
+     * This exists because the first version had no feedback at all: every
+     * attempt was released early — between 550ms and 4600ms — and from the
+     * outside a press that was not registering looked exactly like one being
+     * let go a moment too soon.
+     */
+    NDW_LED_HOLDING,
     /* Discoverable: a pairing window is open. Slow blue blink. */
     NDW_LED_PAIRING,
     /* A console is connected. Double blue flash, then holds dim blue. */
@@ -45,6 +56,9 @@ void ndw_status_init(void);
 
 /** Switches the light to a state. Takes effect on the next tick. */
 void ndw_status_set(ndw_led_t status);
+
+/** How far through a button hold, 0-100. Drives the accelerating blink. */
+void ndw_status_hold_progress(uint8_t percent);
 
 /**
  * One short blue pulse, overlaid on whatever the current state is.

@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "ndw_status.h"
+
 /** Called from a task context when the button has been held long enough. */
 typedef void (*ndw_button_cb_t)(void);
 
@@ -25,3 +27,11 @@ typedef void (*ndw_button_cb_t)(void);
  * should not open two windows.
  */
 void ndw_button_init(ndw_button_cb_t on_long_press);
+
+/**
+ * What the light should return to when a press is abandoned.
+ *
+ * The button task cannot know whether the box is online or merely idle, so
+ * the owner of that fact tells it.
+ */
+void ndw_button_set_idle_state(ndw_led_t state);

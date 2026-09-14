@@ -54,6 +54,9 @@ static volatile ndw_led_t s_status = NDW_LED_IDLE;
 #define PULSE_MAX 3
 static volatile uint8_t s_pulses;
 
+/* 0-100, how far through the hold. Drives the accelerating blink. */
+static volatile uint8_t s_hold_percent;
+
 static void show(rgb_t c)
 {
     /* Null when init found no LED. The task is not started in that case, but
@@ -76,6 +79,19 @@ static void show(rgb_t c)
 static rgb_t frame_for(ndw_led_t status, uint32_t phase)
 {
     switch (status) {
+    case NDW_LED_HOLDING: {
+        /*
+         * Speeds up from about 3Hz to 12Hz as the hold completes, so "nearly
+         * there" is visible rather than implied. Solid at the threshold,
+         * which is the moment the window opens.
+         */
+        if (s_hold_percent >= 100) {
+            return BLUE;
+        }
+        uint32_t period = 320 - (s_hold_percent * 240 / 100);
+        return (phase % period) < (period / 2) ? BLUE : OFF;
+    }
+
     case NDW_LED_PAIRING:
         /* 1Hz: half a second on, half off. Reads as "looking for me". */
         return (phase % 1000) < 500 ? BLUE : OFF;
@@ -187,12 +203,28 @@ void ndw_status_init(void)
     }
 
     led_strip_clear(s_strip);
-    xTaskCreate(status_task, "ndw-status", 2560, NULL, 2, NULL);
+
+    /*
+     * Logged on success, not only on failure. A silent success and a task
+     * that never started look identical from the outside, and the first time
+     * the LED stayed dark that ambiguity cost more to diagnose than this line
+     * costs to print.
+     */
+    if (xTaskCreate(status_task, "ndw-status", 3072, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "could not start the status task; running dark");
+        return;
+    }
+    ESP_LOGI(TAG, "status LED on GPIO%d", LED_GPIO);
 }
 
 void ndw_status_set(ndw_led_t status)
 {
     s_status = status;
+}
+
+void ndw_status_hold_progress(uint8_t percent)
+{
+    s_hold_percent = percent > 100 ? 100 : percent;
 }
 
 void ndw_status_pulse(void)
