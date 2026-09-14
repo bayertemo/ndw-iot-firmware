@@ -64,14 +64,19 @@ jobs:
           base=$(python3 -c "import json;print(json.load(open('builds/${{ matrix.build }}/build.json')).get('revision','0.0.0'))")
           sha=$(git rev-parse --short HEAD)
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Semver-legal: -rc.N sorts below the release, +sha is build
-            # metadata. A board flashed from a PR says so when asked.
-            version="${base}-rc.${{ github.run_number }}+${sha}"
-            publish=false
-          else
+          # Gated on the branch, not the event. Keying this on "is this a
+          # pull_request" let a workflow_dispatch from a feature branch take
+          # the release path: it built as a bare version and committed
+          # binaries onto that branch. Only main publishes, however the run
+          # was started.
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
             version="${base}"
             publish=true
+          else
+            # Semver-legal: -rc.N sorts below the release, +sha is build
+            # metadata. A board flashed from a branch says so when asked.
+            version="${base}-rc.${{ github.run_number }}+${sha}"
+            publish=false
           fi
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -167,6 +172,10 @@ jobs:
           PY
 
       - name: Record the version in the build definition
+        # Only when publishing. On a branch the version carries an -rc suffix,
+        # and writing that back would overwrite the base version the next run
+        # reads — each build would then stack another suffix on the last.
+        if: steps.version.outputs.publish == 'true'
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -210,8 +219,8 @@ jobs:
           git commit -m "Publish ${{ matrix.build }} ${{ steps.version.outputs.version }}"
           git push
 
-      - name: Say so on the pull request
-        if: github.event_name == 'pull_request'
+      - name: Say what was built
+        if: steps.version.outputs.publish != 'true'
         run: |
           {
             echo "### ${{ matrix.build }}"
