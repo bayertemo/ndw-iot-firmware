@@ -1,9 +1,9 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "ndw_status.c" "ndw_button.c"
     INCLUDE_DIRS "."
     # json for the provisioning payload, nvs_flash for proven credentials,
     # bt for NimBLE, esp_wifi for the join.
-    REQUIRES bt nvs_flash esp_wifi esp_netif json
+    REQUIRES bt nvs_flash esp_wifi esp_netif json driver esp_timer
 )
 
 # Carry the version from the build into the firmware.

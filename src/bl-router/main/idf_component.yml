@@ -1,0 +1,9 @@
+## Managed dependencies, fetched at build time from the component registry.
+##
+## led_strip is not bundled with ESP-IDF. Pinning a range rather than "*" so a
+## registry release cannot silently change what CI builds — the same reasoning
+## as pinning the IDF Docker tag.
+dependencies:
+  espressif/led_strip: "^2.5.5"
+  idf:
+    version: ">=5.3"

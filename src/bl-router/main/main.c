@@ -31,6 +31,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -43,7 +44,9 @@
 #include "services/gatt/ble_svc_gatt.h"
 
 #include "cJSON.h"
+#include "ndw_button.h"
 #include "ndw_contract.h"
+#include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
 
@@ -90,6 +93,24 @@ static int s_join_attempts;
 static const char *s_last_failure = NDW_STATUS_FAILED;
 
 static void ndw_advertise(void);
+static void ndw_pairing_close(void);
+
+/*
+ * How long a pairing window stays open.
+ *
+ * Long enough to open the console, scan, connect and type a passphrase;
+ * short enough that a forgotten press does not leave the box discoverable
+ * all afternoon. Pressing again restarts it.
+ */
+#define PAIRING_WINDOW_MS (2 * 60 * 1000)
+
+/* Non-NULL while a window is open. */
+static TimerHandle_t s_pairing_timer;
+static bool s_pairing_open;
+
+/* Whether the radio currently holds an IP. Decides what the light shows
+   once a pairing window closes. */
+static bool s_joined;
 
 /* ---------------------------------------------------------------- identity */
 
@@ -158,6 +179,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
 
         ESP_LOGE(TAG, "join failed (reason %d), giving up", ev->reason);
+        s_joined = false;
         xEventGroupSetBits(s_wifi_events, WIFI_FAILED);
         return;
     }
@@ -165,6 +187,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "joined, ip " IPSTR, IP2STR(&ev->ip_info.ip));
+        s_joined = true;
+        /* Green unless a pairing window is open — the window is the more
+           urgent thing to show while it lasts. */
+        if (!s_pairing_open && s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            ndw_status_set(NDW_LED_ONLINE);
+        }
         xEventGroupSetBits(s_wifi_events, WIFI_JOINED);
     }
 }
@@ -324,13 +352,16 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
 
     ESP_LOGI(TAG, "provisioning for ssid '%s'", ssid_buf);
     ndw_notify_status(NDW_STATUS_CONNECTING);
+    ndw_status_set(NDW_LED_JOINING);
 
     if (ndw_wifi_join(ssid_buf, pass_buf)) {
         /* Proven, so now it is worth keeping across a reboot. */
         ndw_store_credentials(ssid_buf, pass_buf);
         ndw_notify_status(NDW_STATUS_CONNECTED);
+        ndw_status_set(NDW_LED_ONLINE);
     } else {
         ndw_notify_status(s_last_failure);
+        ndw_status_set(NDW_LED_FAILED);
     }
 
     return 0;
@@ -379,8 +410,10 @@ static int on_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "console connected");
-        } else {
-            /* Failed to establish; nothing is listening, so advertise again. */
+            ndw_status_set(NDW_LED_LINKED);
+        } else if (s_pairing_open) {
+            /* Failed to establish; the window is still open, so keep
+               advertising rather than making the technician press again. */
             ndw_advertise();
         }
         return 0;
@@ -389,20 +422,82 @@ static int on_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "console disconnected");
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         /*
-         * Straight back to advertising. A box that stops being discoverable
-         * after one session is a box that needs a power cycle to re-provision,
-         * which is the opposite of the point.
+         * Only back to advertising if the window has not expired. Previously
+         * this restarted unconditionally, which meant one press made the box
+         * discoverable forever — the window would have been decorative.
          */
-        ndw_advertise();
+        if (s_pairing_open) {
+            ndw_advertise();
+        } else {
+            ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
+        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        ndw_advertise();
+        if (s_pairing_open) {
+            ndw_advertise();
+        }
         return 0;
 
     default:
         return 0;
     }
+}
+
+/*
+ * Shuts the pairing window.
+ *
+ * Stops advertising unless a console is mid-session — cutting a technician
+ * off at the two-minute mark while they are typing a passphrase would be its
+ * own bug. The disconnect handler closes things properly once they are done.
+ */
+static void ndw_pairing_close(void)
+{
+    s_pairing_open = false;
+
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGI(TAG, "pairing window expired, but a console is connected");
+        return;
+    }
+
+    ble_gap_adv_stop();
+    ESP_LOGI(TAG, "pairing window closed");
+    ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
+}
+
+static void on_pairing_timeout(TimerHandle_t timer)
+{
+    (void)timer;
+    ndw_pairing_close();
+}
+
+/*
+ * Opens a pairing window. Called from the button task.
+ *
+ * Pressing again while one is open restarts the clock rather than opening a
+ * second: a technician who is not sure whether the first press registered
+ * should be able to press again without making things worse.
+ */
+static void ndw_pairing_open(void)
+{
+    if (s_pairing_timer == NULL) {
+        s_pairing_timer = xTimerCreate("ndw-pair", pdMS_TO_TICKS(PAIRING_WINDOW_MS), pdFALSE,
+                                       NULL, on_pairing_timeout);
+        if (s_pairing_timer == NULL) {
+            ESP_LOGE(TAG, "could not create the pairing timer");
+            return;
+        }
+    }
+
+    bool was_open = s_pairing_open;
+    s_pairing_open = true;
+    xTimerReset(s_pairing_timer, pdMS_TO_TICKS(100));
+
+    if (!was_open && s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ndw_advertise();
+    }
+    ndw_status_set(NDW_LED_PAIRING);
+    ESP_LOGI(TAG, "pairing window open for %ds", PAIRING_WINDOW_MS / 1000);
 }
 
 static void ndw_advertise(void)
@@ -461,8 +556,14 @@ static void ndw_advertise(void)
 static void on_host_sync(void)
 {
     ESP_ERROR_CHECK(ble_hs_util_ensure_addr(0));
-    ndw_advertise();
-    ESP_LOGI(TAG, "advertising");
+    /*
+     * Deliberately does not advertise. The box is invisible until someone
+     * holds the button, so an installed gateway cannot be re-provisioned by
+     * a stranger with a laptop in the car park. That is the whole point of
+     * the window, and it costs physical access to recover a box.
+     */
+    ESP_LOGI(TAG, "ready — hold the button for 5s to pair");
+    ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
 }
 
 static void on_host_reset(int reason)
@@ -491,6 +592,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "NDW BL Router %s", NDW_VERSION);
 
+    ndw_status_init();
     ndw_derive_eui();
     ndw_wifi_init();
 
@@ -526,4 +628,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_gatts_add_svcs(s_services));
 
     nimble_port_freertos_init(ndw_host_task);
+
+    /* Last, so a press cannot open a window before the host is up. */
+    ndw_button_init(ndw_pairing_open);
 }
