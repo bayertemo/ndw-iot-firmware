@@ -1,0 +1,5 @@
+# Build output is committed deliberately — the console fetches it over raw.
+# Only local noise is ignored.
+.DS_Store
+__pycache__/
+*.pyc

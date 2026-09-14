@@ -1,0 +1,23 @@
+{
+  "kind": "ndw/espressif/esp32/d0wd/bl/test-sensor",
+  "name": "NDW Test Sensor \u00b7 ESP32 (original)",
+  "role": "sensor",
+  "description": "Counts button presses. For proving a path end to end.",
+  "chipLabel": "ESP32 (original)",
+  "$comment": "chipMatch is tested against what esptool-js reports after connecting, e.g. 'ESP32-C3 (revision v0.4)'. One build targets one chip: the bootloader offset below differs per family, and a mismatched image leaves the board unbootable until it is reflashed.",
+  "chipMatch": "^ESP32-[A-Z0-9]*D0WD|^ESP32-PICO|^ESP32(?![-\u2013]?(S2|S3|C2|C3|C5|C6|C61|H2|P4))",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "address": 4096
+    },
+    {
+      "path": "partition-table.bin",
+      "address": 32768
+    },
+    {
+      "path": "app.bin",
+      "address": 65536
+    }
+  ]
+}

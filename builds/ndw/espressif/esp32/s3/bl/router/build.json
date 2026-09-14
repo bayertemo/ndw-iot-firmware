@@ -1,0 +1,23 @@
+{
+  "kind": "ndw/espressif/esp32/s3/bl/router",
+  "name": "NDW BL Router \u00b7 ESP32-S3",
+  "role": "gateway",
+  "description": "Relays frames from nearby sensors to the network over WiFi.",
+  "chipLabel": "ESP32-S3",
+  "$comment": "chipMatch is tested against what esptool-js reports after connecting, e.g. 'ESP32-C3 (revision v0.4)'. One build targets one chip: the bootloader offset below differs per family, and a mismatched image leaves the board unbootable until it is reflashed.",
+  "chipMatch": "^ESP32-S3(?!\\d)",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "address": 0
+    },
+    {
+      "path": "partition-table.bin",
+      "address": 32768
+    },
+    {
+      "path": "app.bin",
+      "address": 65536
+    }
+  ]
+}
