@@ -49,6 +49,7 @@
 #include "ndw_button.h"
 #include "ndw_contract.h"
 #include "ndw_scan.h"
+#include "ndw_uplink.h"
 #include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
@@ -789,6 +790,7 @@ static void on_frame(const ndw_frame_t *frame)
 {
     ESP_LOGI(TAG, "beacon %s kind %u count %" PRIu32 " rssi %d", frame->eui, frame->kind,
              frame->counter, frame->rssi);
+    ndw_uplink_publish(frame);
     /* One pulse per frame, overlaid on whatever the light is showing, so a
        relaying router still reads as online between beacons. */
     ndw_status_pulse();
@@ -845,6 +847,7 @@ void app_main(void)
     ndw_status_init();
     ndw_derive_eui();
     ndw_wifi_init();
+    ndw_uplink_init(s_eui);
 
     /*
      * Rejoin a known network before BLE comes up, so a box that has been
