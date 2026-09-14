@@ -66,6 +66,11 @@ jobs:
           - target: esp32c3
             project: bl-router
             build: ndw/espressif/esp32/c3/bl/router
+            app: ndw-bl-router
+          - target: esp32c3
+            project: bl-test-button
+            build: ndw/espressif/esp32/c3/bl/test-button
+            app: ndw-test-button
 
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +137,7 @@ jobs:
           cp "$src/bootloader/bootloader.bin" "$out/bootloader.bin"
           cp "$src/partition_table/partition-table.bin" "$out/partition-table.bin"
           cp "$src/ota_data_initial.bin" "$out/ota-data-initial.bin"
-          cp "$src/ndw-bl-router.bin" "$out/app.bin"
+          cp "$src/${{ matrix.app }}.bin" "$out/app.bin"
 
           ls -l "$out"/*.bin
 
@@ -160,7 +165,7 @@ jobs:
               "bootloader.bin": "bootloader.bin",
               "partition-table.bin": "partition-table.bin",
               "ota-data-initial.bin": "ota_data_initial.bin",
-              "app.bin": "ndw-bl-router.bin",
+              "app.bin": "${{ matrix.app }}.bin",
           }
 
           build = json.loads(pathlib.Path("builds/${{ matrix.build }}/build.json").read_text())
