@@ -89,6 +89,16 @@ static char s_eui[NDW_EUI_LEN + 1];
 static uint16_t s_status_handle;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static int s_join_attempts;
+
+/*
+ * Set while a join is being set up, cleared once the new config is in.
+ *
+ * esp_wifi_disconnect() raises STA_DISCONNECTED, and the handler's job is to
+ * retry — so without this it reconnected using the *old* config, racing the
+ * set_config on the next line and spending a retry on the network we were
+ * leaving. A box given new credentials would keep trying the previous ones.
+ */
+static volatile bool s_reconfiguring;
 /* Set from the disconnect reason, so the reported failure names a cause. */
 static const char *s_last_failure = NDW_STATUS_FAILED;
 
@@ -111,6 +121,18 @@ static bool s_pairing_open;
 /* Whether the radio currently holds an IP. Decides what the light shows
    once a pairing window closes. */
 static bool s_joined;
+
+/*
+ * The network this box is on, or is trying. Held in RAM so status reads do
+ * not hit NVS, and so the console can show which SSID is configured without
+ * being told — that is what lets it mask the fields rather than presenting
+ * empty ones to a box that is already provisioned.
+ *
+ * The passphrase is deliberately not kept here. Nothing reads it back: it is
+ * written to NVS once proven and handed to the driver, and a copy that can be
+ * read over BLE would undo the point of never sending it to our API.
+ */
+static char s_ssid[SSID_MAX];
 
 /* ---------------------------------------------------------------- identity */
 
@@ -151,6 +173,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = data;
+
+        /*
+         * Our own teardown, not a failed association. Retrying here would
+         * reconnect to the network being replaced and consume an attempt.
+         */
+        if (s_reconfiguring) {
+            return;
+        }
 
         /*
          * The reason code is the only signal that separates "wrong password"
@@ -240,15 +270,41 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
     s_last_failure = NDW_STATUS_FAILED;
     xEventGroupClearBits(s_wifi_events, WIFI_JOINED | WIFI_FAILED);
 
-    ESP_ERROR_CHECK(esp_wifi_disconnect());
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
-    ESP_ERROR_CHECK(esp_wifi_connect());
+    /*
+     * Not ESP_ERROR_CHECK: disconnect fails when there is nothing to
+     * disconnect from, which is the normal case for a box being provisioned
+     * for the first time. Aborting the whole board over it would turn "no
+     * network yet" into a reboot loop.
+     */
+    s_reconfiguring = true;
+    esp_wifi_disconnect();
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    s_reconfiguring = false;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not set the wifi config: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not start the join: %s", esp_err_to_name(err));
+        return false;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_JOINED | WIFI_FAILED, pdFALSE,
                                            pdFALSE, pdMS_TO_TICKS(JOIN_TIMEOUT_MS));
 
+    if ((bits & WIFI_JOINED) != 0) {
+        return true;
+    }
+
     /* A timeout with neither bit set is its own failure, not a success. */
-    return (bits & WIFI_JOINED) != 0;
+    if ((bits & WIFI_FAILED) == 0) {
+        ESP_LOGE(TAG, "join to '%s' timed out after %dms", ssid, JOIN_TIMEOUT_MS);
+        s_last_failure = NDW_STATUS_FAILED;
+    }
+    return false;
 }
 
 /* --------------------------------------------------------------- storage */
@@ -285,13 +341,52 @@ static void ndw_store_credentials(const char *ssid, const char *pass)
 
 /* ------------------------------------------------------------------- gatt */
 
+/*
+ * Renders the current state as the JSON the contract describes.
+ *
+ * Assembled by hand rather than with cJSON: five fields of known shape, and
+ * the allocation-free version is both shorter and cannot fail part-way
+ * through a notify.
+ */
+static int ndw_status_json(char *out, size_t len, const char *state)
+{
+    char ip[16] = "";
+    int8_t rssi = 0;
+
+    if (s_joined) {
+        esp_netif_ip_info_t info;
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif != NULL && esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            snprintf(ip, sizeof(ip), IPSTR, IP2STR(&info.ip));
+        }
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            rssi = ap.rssi;
+        }
+    }
+
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+    return snprintf(out, len,
+                    "{\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
+                    "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d}",
+                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
+}
+
 static void ndw_notify_status(const char *status)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_status_handle == 0) {
         return;
     }
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(status, strlen(status));
+    char body[192];
+    int n = ndw_status_json(body, sizeof(body), status);
+    if (n <= 0) {
+        return;
+    }
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(body, (uint16_t)n);
     if (om != NULL) {
         ble_gatts_notify_custom(s_conn_handle, s_status_handle, om);
     }
@@ -310,6 +405,32 @@ static int on_eui_read(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
      * and the console rejects that case rather than guessing.
      */
     return os_mbuf_append(ctxt->om, s_eui, NDW_EUI_LEN) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+/*
+ * Current state, on demand.
+ *
+ * The console reads this before showing the form: a box that already has an
+ * SSID gets masked fields and an explicit override, rather than empty ones
+ * that invite retyping credentials the box is already using.
+ */
+static int on_status_read(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt,
+                          void *arg)
+{
+    (void)conn;
+    (void)attr;
+    (void)arg;
+
+    const char *state = s_joined         ? NDW_STATUS_CONNECTED
+                        : s_ssid[0]      ? NDW_STATUS_FAILED
+                                         : "unprovisioned";
+
+    char body[192];
+    int n = ndw_status_json(body, sizeof(body), state);
+    if (n <= 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return os_mbuf_append(ctxt->om, body, (uint16_t)n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
 static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -350,6 +471,7 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     strlcpy(pass_buf, pass->valuestring, sizeof(pass_buf));
     cJSON_Delete(doc);
 
+    strlcpy(s_ssid, ssid_buf, sizeof(s_ssid));
     ESP_LOGI(TAG, "provisioning for ssid '%s'", ssid_buf);
     ndw_notify_status(NDW_STATUS_CONNECTING);
     ndw_status_set(NDW_LED_JOINING);
@@ -389,7 +511,7 @@ static const struct ble_gatt_svc_def s_services[] = {
                 },
                 {
                     .uuid = &(ble_uuid128_t)NDW_STATUS_UUID.u,
-                    .access_cb = on_eui_read, /* readable, but only notify matters */
+                    .access_cb = on_status_read,
                     .val_handle = &s_status_handle,
                     .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
                 },
@@ -607,6 +729,7 @@ void app_main(void)
     char ssid[SSID_MAX] = {0};
     char pass[PASS_MAX] = {0};
     if (ndw_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        strlcpy(s_ssid, ssid, sizeof(s_ssid));
         ESP_LOGI(TAG, "rejoining stored network '%s'", ssid);
         if (!ndw_wifi_join(ssid, pass)) {
             /*
