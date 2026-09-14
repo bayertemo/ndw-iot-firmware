@@ -1,0 +1,29 @@
+# NimBLE rather than Bluedroid: the peripheral role is all this needs, and
+# NimBLE is roughly half the flash and RAM. The C3 has 4MB, but the margin
+# matters once MQTT and TLS arrive.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# One connection: a technician provisions one box at a time, and the extra
+# contexts are RAM spent on a case that does not happen.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# 517 lets the WiFi JSON arrive in a single write. At the 23-byte default it
+# would need reassembly across several, which is more code and more failure.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+
+# Both radios share one antenna on the C3. Without coexistence enabled, BLE
+# advertising and a WiFi join interfere badly enough to look like bad
+# credentials — and provisioning does exactly those two things at once.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# The app has to fit beside two OTA slots, which the factory layout does not
+# allow for. See partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

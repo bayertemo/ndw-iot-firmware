@@ -1,0 +1,165 @@
+name: Build firmware
+
+# Every push builds. What differs is what the build is called and whether it
+# is committed:
+#
+#   main          → x.y.z            committed, and the console offers it
+#   pull request  → x.y.z-rc.<n>+sha built and attached to the run, never
+#                                    committed to main
+#
+# The -rc suffix is not cosmetic. The console reads one manifest and offers
+# whatever is in it, so an unreviewed build reaching main is a build a
+# technician can flash onto real hardware. A release candidate has to be
+# nameable and testable without being publishable, and the version string is
+# what carries that distinction into the field — a board reports its own
+# revision, and "0.1.0" on a bench that was flashed from a PR is a lie nobody
+# can detect later.
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'src/**'
+      - 'builds/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'builds/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  # Pinned, not release-vX or latest: a toolchain that moves on its own turns
+  # an unrelated push into a different binary, and "it built last week" stops
+  # being evidence of anything.
+  IDF_IMAGE: espressif/idf:release-v5.3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One job per target. Independent, so a C3 failure does not hide an S3
+      # result, and adding a chip is adding a row here.
+      fail-fast: false
+      matrix:
+        include:
+          - target: esp32c3
+            project: bl-router
+            build: ndw/espressif/esp32/c3/bl/router
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          # The release version lives beside the build definition, so bumping
+          # it is a reviewable change rather than a workflow edit.
+          base=$(python3 -c "import json;print(json.load(open('builds/${{ matrix.build }}/build.json')).get('revision','0.0.0'))")
+          sha=$(git rev-parse --short HEAD)
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Semver-legal: -rc.N sorts below the release, +sha is build
+            # metadata. A board flashed from a PR says so when asked.
+            version="${base}-rc.${{ github.run_number }}+${sha}"
+            publish=false
+          else
+            version="${base}"
+            publish=true
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ matrix.build }} as ${version}"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/work" -w "/work/src/${{ matrix.project }}" \
+            -e "NDW_VERSION=${{ steps.version.outputs.version }}" \
+            "${IDF_IMAGE}" \
+            /bin/bash -c '
+              set -euo pipefail
+              . $IDF_PATH/export.sh >/dev/null
+              idf.py set-target ${{ matrix.target }}
+              # The version reaches the firmware as a define rather than a
+              # generated header, so nothing in the tree changes per build.
+              idf.py -DNDW_VERSION="\"${NDW_VERSION}\"" build
+            '
+
+      - name: Collect the images
+        run: |
+          set -euo pipefail
+          out="builds/${{ matrix.build }}"
+          src="src/${{ matrix.project }}/build"
+
+          # Names the manifest already expects. Copied rather than symlinked
+          # so the committed tree holds real bytes.
+          cp "$src/bootloader/bootloader.bin" "$out/bootloader.bin"
+          cp "$src/partition_table/partition-table.bin" "$out/partition-table.bin"
+          cp "$src/ndw-bl-router.bin" "$out/app.bin"
+
+          ls -l "$out"/*.bin
+
+      - name: Record the version in the build definition
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("builds/${{ matrix.build }}/build.json")
+          doc = json.loads(p.read_text())
+          doc["revision"] = os.environ["VERSION"]
+          p.write_text(json.dumps(doc, indent=2) + "\n")
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Rebuild the manifest
+        run: python3 scripts/build-manifest.py
+
+      - name: Attach the build to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ steps.version.outputs.version }}
+          path: |
+            builds/${{ matrix.build }}/*.bin
+            manifest.json
+          # Long enough to test a candidate, short enough that stale binaries
+          # do not accumulate. Artifacts are not what the console reads —
+          # their download URLs are not CORS-open — so this is for humans.
+          retention-days: 14
+
+      - name: Publish
+        # Only from main. A pull request builds and is downloadable, but it
+        # must not reach the manifest the console serves.
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "nothing changed"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add builds manifest.json
+          git commit -m "Publish ${{ matrix.build }} ${{ steps.version.outputs.version }}"
+          git push
+
+      - name: Say so on the pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "### ${{ matrix.build }}"
+            echo
+            echo "Built \`${{ steps.version.outputs.version }}\` — **not published**."
+            echo
+            echo "Download it from this run's artifacts to flash a bench board."
+            echo "The console only offers what is in \`manifest.json\` on \`main\`."
+          } >> "$GITHUB_STEP_SUMMARY"

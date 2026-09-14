@@ -1,0 +1,23 @@
+# Two OTA slots, so a router can be updated over the air later without a cable
+# — the whole point of a gateway that stays online. A factory-only layout would
+# make every future update a site visit.
+#
+# ota_0 sits at 0x10000, which is the offset the firmware manifest publishes
+# for app.bin and therefore what the console writes to. Those two numbers live
+# in different places with nothing checking them against each other, and a
+# mismatch does not fail the flash: it writes happily and the board never
+# boots. Change one, change the other.
+#
+# That fixes the app start, so everything else has to fit in the 0x9000-0x10000
+# window below it — 28KB, which nvs and otadata just fill. There is no phy_init
+# partition because ESP-IDF keeps RF calibration in nvs unless told otherwise,
+# and a separate one would not fit here anyway.
+#
+# Sizes are 1.5MB per slot, leaving roughly 900KB spare on a 4MB part for the
+# TLS and MQTT stacks still to come.
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+ota_0,    app,  ota_0,   0x10000,  0x180000,
+ota_1,    app,  ota_1,   0x190000, 0x180000,
