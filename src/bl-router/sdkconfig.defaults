@@ -26,4 +26,15 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# ESP-IDF defaults to 2MB regardless of the part actually fitted, and the
+# partition table is validated against this number rather than the hardware —
+# so a 3.1MB layout fails the build with "does not fit in configured flash
+# size 2MB" even on a 4MB board. Most ESP32-C3 modules (C3-MINI-1, C3-WROOM-02,
+# and the usual DevKitM-1) carry 4MB.
+#
+# This is a claim about the hardware, not a request: setting it larger than
+# the fitted part produces images that flash and then fail at runtime when
+# something reads past the end.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
