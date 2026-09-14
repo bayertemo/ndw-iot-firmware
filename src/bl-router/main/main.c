@@ -22,6 +22,8 @@
  * enough to prove that path against real silicon.
  */
 
+#include <ctype.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -31,6 +33,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -43,7 +46,10 @@
 #include "services/gatt/ble_svc_gatt.h"
 
 #include "cJSON.h"
+#include "ndw_button.h"
 #include "ndw_contract.h"
+#include "ndw_scan.h"
+#include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
 
@@ -83,6 +89,9 @@ static EventGroupHandle_t s_wifi_events;
 #define WIFI_FAILED BIT1
 
 static char s_eui[NDW_EUI_LEN + 1];
+
+/* What this box calls itself on the network. Defaults to the EUI suffix. */
+static char s_hostname[33];
 static uint16_t s_status_handle;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static int s_join_attempts;
@@ -90,16 +99,46 @@ static int s_join_attempts;
 /*
  * Set while a join is being set up, cleared once the new config is in.
  *
- * esp_wifi_disconnect() raises STA_DISCONNECTED and the handler's job is to
+ * esp_wifi_disconnect() raises STA_DISCONNECTED, and the handler's job is to
  * retry — so without this it reconnected using the *old* config, racing the
- * set_config on the next line and spending an attempt on the network being
- * left behind.
+ * set_config on the next line and spending a retry on the network we were
+ * leaving. A box given new credentials would keep trying the previous ones.
  */
 static volatile bool s_reconfiguring;
 /* Set from the disconnect reason, so the reported failure names a cause. */
 static const char *s_last_failure = NDW_STATUS_FAILED;
 
 static void ndw_advertise(void);
+static void ndw_pairing_close(void);
+
+/*
+ * How long a pairing window stays open.
+ *
+ * Long enough to open the console, scan, connect and type a passphrase;
+ * short enough that a forgotten press does not leave the box discoverable
+ * all afternoon. Pressing again restarts it.
+ */
+#define PAIRING_WINDOW_MS (2 * 60 * 1000)
+
+/* Non-NULL while a window is open. */
+static TimerHandle_t s_pairing_timer;
+static bool s_pairing_open;
+
+/* Whether the radio currently holds an IP. Decides what the light shows
+   once a pairing window closes. */
+static bool s_joined;
+
+/*
+ * The network this box is on, or is trying. Held in RAM so status reads do
+ * not hit NVS, and so the console can show which SSID is configured without
+ * being told — that is what lets it mask the fields rather than presenting
+ * empty ones to a box that is already provisioned.
+ *
+ * The passphrase is deliberately not kept here. Nothing reads it back: it is
+ * written to NVS once proven and handed to the driver, and a copy that can be
+ * read over BLE would undo the point of never sending it to our API.
+ */
+static char s_ssid[SSID_MAX];
 
 /* ---------------------------------------------------------------- identity */
 
@@ -123,6 +162,53 @@ static void ndw_derive_eui(void)
              mac[4], mac[5]);
 
     ESP_LOGI(TAG, "eui %s", s_eui);
+    /* Until a label arrives, the last six of the EUI — the same suffix the
+       BLE advertisement uses, so the two agree. */
+    snprintf(s_hostname, sizeof(s_hostname), "NDW-%s", s_eui + NDW_EUI_LEN - 6);
+}
+
+/*
+ * What this box calls itself on the network.
+ *
+ * Defaults to the last six of the EUI, so an unnamed box is still
+ * identifiable rather than appearing as "espressif". A label supplied at
+ * provisioning replaces it: DHCP tables and router UIs are where people
+ * actually look for a device, and "NDW-basement-riser" is findable in a way
+ * that a hex identifier is not.
+ */
+/*
+ * DHCP hostnames are not free text. RFC 1123 allows letters, digits and
+ * hyphens, and nothing else — a label with a space or an apostrophe would be
+ * rejected or silently mangled by the router, so it is folded here rather
+ * than trusted.
+ */
+static void ndw_set_hostname(const char *label)
+{
+    size_t out = 0;
+    out += (size_t)snprintf(s_hostname, sizeof(s_hostname), "NDW-");
+
+    bool last_was_dash = true;
+    for (const char *c = label; *c != '\0' && out < sizeof(s_hostname) - 1; c++) {
+        if (isalnum((unsigned char)*c)) {
+            s_hostname[out++] = (char)tolower((unsigned char)*c);
+            last_was_dash = false;
+        } else if (!last_was_dash) {
+            /* Runs of punctuation collapse to one hyphen rather than
+               producing "a--b" or a trailing dash. */
+            s_hostname[out++] = '-';
+            last_was_dash = true;
+        }
+    }
+    while (out > 0 && s_hostname[out - 1] == '-') {
+        out--;
+    }
+    s_hostname[out] = '\0';
+
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_set_hostname(netif, s_hostname);
+    }
+    ESP_LOGI(TAG, "hostname %s", s_hostname);
 }
 
 /* -------------------------------------------------------------------- wifi */
@@ -141,7 +227,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = data;
 
-        /* Our own teardown, not a failed association. */
+        /*
+         * Our own teardown, not a failed association. Retrying here would
+         * reconnect to the network being replaced and consume an attempt.
+         */
         if (s_reconfiguring) {
             return;
         }
@@ -152,15 +241,24 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * failure reads the same to a technician, who then re-types a
          * password that was correct.
          */
+        /*
+         * Keep the most specific reason across attempts, not the last one.
+         *
+         * A first attempt often reports NO_AP_FOUND simply because the scan
+         * has not settled, and a later one then reports the real problem. The
+         * log that prompted this read "reason 201, retry 1" followed by
+         * "reason 15" — no-such-network followed by wrong-passphrase — and
+         * reporting whichever arrived last would have sent a technician to
+         * check the wrong thing.
+         *
+         * An auth failure is evidence the AP was found and answered, so it
+         * outranks not-found however the attempts are ordered.
+         */
         switch (ev->reason) {
         case WIFI_REASON_NO_AP_FOUND:
-            /*
-             * Keep the most specific reason across attempts. A first attempt
-             * often reports NO_AP_FOUND because the scan has not settled, and
-             * a later one reports the real problem — a log read "reason 201"
-             * then "reason 15", and reporting the last would send a
-             * technician to check the network when the password was wrong.
-             */
+            /* strcmp, not pointer comparison: these are string literals and
+               the compiler is right that comparing their addresses is
+               unspecified. */
             if (strcmp(s_last_failure, NDW_STATUS_BAD_AUTH) != 0) {
                 s_last_failure = NDW_STATUS_NOT_FOUND;
             }
@@ -171,7 +269,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             s_last_failure = NDW_STATUS_BAD_AUTH;
             break;
         default:
-            s_last_failure = NDW_STATUS_FAILED;
+            /* Only when nothing more specific has been seen. */
+            if (strcmp(s_last_failure, NDW_STATUS_NOT_FOUND) != 0 &&
+                strcmp(s_last_failure, NDW_STATUS_BAD_AUTH) != 0) {
+                s_last_failure = NDW_STATUS_FAILED;
+            }
             break;
         }
 
@@ -182,6 +284,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
 
         ESP_LOGE(TAG, "join failed (reason %d), giving up", ev->reason);
+        s_joined = false;
         xEventGroupSetBits(s_wifi_events, WIFI_FAILED);
         return;
     }
@@ -189,6 +292,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "joined, ip " IPSTR, IP2STR(&ev->ip_info.ip));
+        s_joined = true;
+        /* Green unless a pairing window is open — the window is the more
+           urgent thing to show while it lasts. */
+        if (!s_pairing_open && s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            ndw_status_set(NDW_LED_ONLINE);
+        }
         xEventGroupSetBits(s_wifi_events, WIFI_JOINED);
     }
 }
@@ -238,10 +347,19 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
 
     /*
      * Not ESP_ERROR_CHECK: disconnect fails when there is nothing to
-     * disconnect from, which is the normal state of a box being provisioned
-     * for the first time. Aborting over it turned "no network yet" into a
-     * reboot loop at the exact moment credentials arrived.
+     * disconnect from, which is the normal case for a box being provisioned
+     * for the first time. Aborting the whole board over it would turn "no
+     * network yet" into a reboot loop.
      */
+    /*
+     * Re-applied here because esp_netif_set_hostname only sticks while the
+     * interface exists, and the name may have been set before it came up.
+     */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_set_hostname(netif, s_hostname);
+    }
+
     s_reconfiguring = true;
     esp_wifi_disconnect();
 
@@ -261,8 +379,16 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_JOINED | WIFI_FAILED, pdFALSE,
                                            pdFALSE, pdMS_TO_TICKS(JOIN_TIMEOUT_MS));
 
+    if ((bits & WIFI_JOINED) != 0) {
+        return true;
+    }
+
     /* A timeout with neither bit set is its own failure, not a success. */
-    return (bits & WIFI_JOINED) != 0;
+    if ((bits & WIFI_FAILED) == 0) {
+        ESP_LOGE(TAG, "join to '%s' timed out after %dms", ssid, JOIN_TIMEOUT_MS);
+        s_last_failure = NDW_STATUS_FAILED;
+    }
+    return false;
 }
 
 /* --------------------------------------------------------------- storage */
@@ -299,13 +425,52 @@ static void ndw_store_credentials(const char *ssid, const char *pass)
 
 /* ------------------------------------------------------------------- gatt */
 
+/*
+ * Renders the current state as the JSON the contract describes.
+ *
+ * Assembled by hand rather than with cJSON: five fields of known shape, and
+ * the allocation-free version is both shorter and cannot fail part-way
+ * through a notify.
+ */
+static int ndw_status_json(char *out, size_t len, const char *state)
+{
+    char ip[16] = "";
+    int8_t rssi = 0;
+
+    if (s_joined) {
+        esp_netif_ip_info_t info;
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif != NULL && esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            snprintf(ip, sizeof(ip), IPSTR, IP2STR(&info.ip));
+        }
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            rssi = ap.rssi;
+        }
+    }
+
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+    return snprintf(out, len,
+                    "{\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
+                    "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d}",
+                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
+}
+
 static void ndw_notify_status(const char *status)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_status_handle == 0) {
         return;
     }
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(status, strlen(status));
+    char body[192];
+    int n = ndw_status_json(body, sizeof(body), status);
+    if (n <= 0) {
+        return;
+    }
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(body, (uint16_t)n);
     if (om != NULL) {
         ble_gatts_notify_custom(s_conn_handle, s_status_handle, om);
     }
@@ -324,6 +489,32 @@ static int on_eui_read(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
      * and the console rejects that case rather than guessing.
      */
     return os_mbuf_append(ctxt->om, s_eui, NDW_EUI_LEN) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+/*
+ * Current state, on demand.
+ *
+ * The console reads this before showing the form: a box that already has an
+ * SSID gets masked fields and an explicit override, rather than empty ones
+ * that invite retyping credentials the box is already using.
+ */
+static int on_status_read(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt,
+                          void *arg)
+{
+    (void)conn;
+    (void)attr;
+    (void)arg;
+
+    const char *state = s_joined         ? NDW_STATUS_CONNECTED
+                        : s_ssid[0]      ? NDW_STATUS_FAILED
+                                         : "unprovisioned";
+
+    char body[192];
+    int n = ndw_status_json(body, sizeof(body), state);
+    if (n <= 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return os_mbuf_append(ctxt->om, body, (uint16_t)n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
 static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -351,6 +542,12 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
 
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(doc, "ssid");
     const cJSON *pass = cJSON_GetObjectItemCaseSensitive(doc, "password");
+    /*
+     * Optional. The label is a cloud attribute the box has no need for, with
+     * one exception: it makes a far better DHCP hostname than a hex EUI, so
+     * a router shows up on the network as something a person recognises.
+     */
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
 
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0' || !cJSON_IsString(pass)) {
         ESP_LOGW(TAG, "provisioning payload missing ssid or password");
@@ -362,17 +559,24 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     char pass_buf[PASS_MAX];
     strlcpy(ssid_buf, ssid->valuestring, sizeof(ssid_buf));
     strlcpy(pass_buf, pass->valuestring, sizeof(pass_buf));
+    if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
+        ndw_set_hostname(name->valuestring);
+    }
     cJSON_Delete(doc);
 
+    strlcpy(s_ssid, ssid_buf, sizeof(s_ssid));
     ESP_LOGI(TAG, "provisioning for ssid '%s'", ssid_buf);
     ndw_notify_status(NDW_STATUS_CONNECTING);
+    ndw_status_set(NDW_LED_JOINING);
 
     if (ndw_wifi_join(ssid_buf, pass_buf)) {
         /* Proven, so now it is worth keeping across a reboot. */
         ndw_store_credentials(ssid_buf, pass_buf);
         ndw_notify_status(NDW_STATUS_CONNECTED);
+        ndw_status_set(NDW_LED_ONLINE);
     } else {
         ndw_notify_status(s_last_failure);
+        ndw_status_set(NDW_LED_FAILED);
     }
 
     return 0;
@@ -400,7 +604,7 @@ static const struct ble_gatt_svc_def s_services[] = {
                 },
                 {
                     .uuid = &(ble_uuid128_t)NDW_STATUS_UUID.u,
-                    .access_cb = on_eui_read, /* readable, but only notify matters */
+                    .access_cb = on_status_read,
                     .val_handle = &s_status_handle,
                     .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
                 },
@@ -421,8 +625,10 @@ static int on_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "console connected");
-        } else {
-            /* Failed to establish; nothing is listening, so advertise again. */
+            ndw_status_set(NDW_LED_LINKED);
+        } else if (s_pairing_open) {
+            /* Failed to establish; the window is still open, so keep
+               advertising rather than making the technician press again. */
             ndw_advertise();
         }
         return 0;
@@ -431,20 +637,92 @@ static int on_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "console disconnected");
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         /*
-         * Straight back to advertising. A box that stops being discoverable
-         * after one session is a box that needs a power cycle to re-provision,
-         * which is the opposite of the point.
+         * Only back to advertising if the window has not expired. Previously
+         * this restarted unconditionally, which meant one press made the box
+         * discoverable forever — the window would have been decorative.
          */
-        ndw_advertise();
+        if (s_pairing_open) {
+            ndw_advertise();
+        } else if (ndw_status_get() == NDW_LED_FAILED) {
+            /*
+             * Hold a failure on the light after the console goes away. The
+             * console disconnects the moment provisioning finishes, and
+             * dropping straight to idle threw away the one signal a
+             * technician standing at the box could still read.
+             */
+            ESP_LOGI(TAG, "holding the failure on the light");
+        } else {
+            ndw_status_set(s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE);
+        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        ndw_advertise();
+        if (s_pairing_open) {
+            ndw_advertise();
+        }
         return 0;
 
     default:
         return 0;
     }
+}
+
+/*
+ * Shuts the pairing window.
+ *
+ * Stops advertising unless a console is mid-session — cutting a technician
+ * off at the two-minute mark while they are typing a passphrase would be its
+ * own bug. The disconnect handler closes things properly once they are done.
+ */
+static void ndw_pairing_close(void)
+{
+    s_pairing_open = false;
+
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGI(TAG, "pairing window expired, but a console is connected");
+        return;
+    }
+
+    ble_gap_adv_stop();
+    ESP_LOGI(TAG, "pairing window closed");
+    ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
+    ndw_status_set(resting);
+    ndw_button_set_idle_state(resting);
+}
+
+static void on_pairing_timeout(TimerHandle_t timer)
+{
+    (void)timer;
+    ndw_pairing_close();
+}
+
+/*
+ * Opens a pairing window. Called from the button task.
+ *
+ * Pressing again while one is open restarts the clock rather than opening a
+ * second: a technician who is not sure whether the first press registered
+ * should be able to press again without making things worse.
+ */
+static void ndw_pairing_open(void)
+{
+    if (s_pairing_timer == NULL) {
+        s_pairing_timer = xTimerCreate("ndw-pair", pdMS_TO_TICKS(PAIRING_WINDOW_MS), pdFALSE,
+                                       NULL, on_pairing_timeout);
+        if (s_pairing_timer == NULL) {
+            ESP_LOGE(TAG, "could not create the pairing timer");
+            return;
+        }
+    }
+
+    bool was_open = s_pairing_open;
+    s_pairing_open = true;
+    xTimerReset(s_pairing_timer, pdMS_TO_TICKS(100));
+
+    if (!was_open && s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ndw_advertise();
+    }
+    ndw_status_set(NDW_LED_PAIRING);
+    ESP_LOGI(TAG, "pairing window open for %ds", PAIRING_WINDOW_MS / 1000);
 }
 
 static void ndw_advertise(void)
@@ -500,11 +778,42 @@ static void ndw_advertise(void)
     }
 }
 
+/*
+ * A beacon arrived.
+ *
+ * Logged and shown on the light for now. This is where MQTT publication goes
+ * once the uplink exists — the router has the frame, its own EUI and the RSSI
+ * it heard it at, which is everything a gateway contributes to a reading.
+ */
+static void on_frame(const ndw_frame_t *frame)
+{
+    ESP_LOGI(TAG, "beacon %s kind %u count %" PRIu32 " rssi %d", frame->eui, frame->kind,
+             frame->counter, frame->rssi);
+    /* One pulse per frame, overlaid on whatever the light is showing, so a
+       relaying router still reads as online between beacons. */
+    ndw_status_pulse();
+}
+
 static void on_host_sync(void)
 {
     ESP_ERROR_CHECK(ble_hs_util_ensure_addr(0));
-    ndw_advertise();
-    ESP_LOGI(TAG, "advertising");
+    /*
+     * Deliberately does not advertise. The box is invisible until someone
+     * holds the button, so an installed gateway cannot be re-provisioned by
+     * a stranger with a laptop in the car park. That is the whole point of
+     * the window, and it costs physical access to recover a box.
+     */
+    /*
+     * Scanning starts here and never stops. Advertising is the exceptional
+     * state — a two-minute pairing window — while listening is what the box
+     * is for, so the two share the radio with listening as the default.
+     */
+    ndw_scan_start(on_frame);
+
+    ESP_LOGI(TAG, "ready — hold the button for 3s to pair");
+    ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
+    ndw_status_set(resting);
+    ndw_button_set_idle_state(resting);
 }
 
 static void on_host_reset(int reason)
@@ -533,6 +842,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "NDW BL Router %s", NDW_VERSION);
 
+    ndw_status_init();
     ndw_derive_eui();
     ndw_wifi_init();
 
@@ -543,6 +853,7 @@ void app_main(void)
     char ssid[SSID_MAX] = {0};
     char pass[PASS_MAX] = {0};
     if (ndw_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        strlcpy(s_ssid, ssid, sizeof(s_ssid));
         ESP_LOGI(TAG, "rejoining stored network '%s'", ssid);
         if (!ndw_wifi_join(ssid, pass)) {
             /*
@@ -568,4 +879,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_gatts_add_svcs(s_services));
 
     nimble_port_freertos_init(ndw_host_task);
+
+    /* Last, so a press cannot open a window before the host is up. */
+    ndw_button_init(ndw_pairing_open);
 }
