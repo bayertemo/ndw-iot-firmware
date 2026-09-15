@@ -7,6 +7,7 @@
 #include "host/ble_hs.h"
 
 #include "ndw_beacon.h"
+#include "ndw_telemetry.h"
 
 static const char *TAG = "ndw-scan";
 
@@ -92,8 +93,22 @@ static int on_scan_event(struct ble_gap_event *event, void *arg)
 
         ndw_frame_t frame;
         if (!parse_frame(&fields, event->disc.rssi, &frame)) {
+            /*
+             * Not ours, but still counted. Knowing how much non-NDW traffic a
+             * site carries is what separates "no sensors in range" from "the
+             * band is saturated" — two problems needing opposite responses.
+             * Identified by BLE address, since a foreign advertisement has no
+             * EUI we can read.
+             */
+            char addr[17];
+            const uint8_t *a = event->disc.addr.val;
+            snprintf(addr, sizeof(addr), "%02x%02x%02x%02x%02x%02x00", a[5], a[4], a[3], a[2],
+                     a[1], a[0]);
+            ndw_telemetry_saw(addr, event->disc.rssi, false);
             return 0;
         }
+
+        ndw_telemetry_saw(frame.eui, frame.rssi, true);
 
         s_count++;
         if (s_callback != NULL) {
