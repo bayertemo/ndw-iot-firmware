@@ -17,9 +17,10 @@
  * — with no way in except BLE, which is exactly the state a technician cannot
  * diagnose from the outside.
  *
- * MQTT is deliberately not here yet. Getting a box onto WiFi and answering to
- * its EUI is the whole of what the console's claim flow needs, and it is
- * enough to prove that path against real silicon.
+ * Once provisioned it scans continuously and relays what it hears. Everything
+ * it sends — relayed readings and its own telemetry — goes through one queue
+ * (ndw_queue.h) rather than straight to the broker, so the radio never waits
+ * on the network and an outage holds messages instead of discarding them.
  */
 
 #include <ctype.h>
@@ -47,8 +48,12 @@
 
 #include "cJSON.h"
 #include "ndw_button.h"
+#include "ndw_command.h"
 #include "ndw_contract.h"
+#include "ndw_queue.h"
 #include "ndw_scan.h"
+#include "ndw_telemetry.h"
+#include "ndw_uplink.h"
 #include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
@@ -236,6 +241,23 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
 
         /*
+         * Losing a network the box was actually on, rather than failing to
+         * join one. Reported as an event because the gap it opens is the
+         * thing worth explaining: without it, a box that dropped off at 2am
+         * and came back at 6 is indistinguishable from one that was never
+         * asked. The report carries uptime, so the server can place the
+         * outage even though the box has no clock.
+         *
+         * Only on the transition. This handler runs once per retry, and
+         * notifying each time would queue three reports for one failed join
+         * — all of them saying the same thing.
+         */
+        if (s_joined) {
+            s_joined = false;
+            ndw_telemetry_notify(NDW_TELEMETRY_OFFLINE);
+        }
+
+        /*
          * The reason code is the only signal that separates "wrong password"
          * from "no such network" from "the AP is just busy". Without it every
          * failure reads the same to a technician, who then re-types a
@@ -293,6 +315,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         const ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "joined, ip " IPSTR, IP2STR(&ev->ip_info.ip));
         s_joined = true;
+        /* An event, not a wait for the next heartbeat: a join five minutes
+           ago and a join just now mean different things. */
+        ndw_telemetry_notify(NDW_TELEMETRY_NETWORK);
         /* Green unless a pairing window is open — the window is the more
            urgent thing to show while it lasts. */
         if (!s_pairing_open && s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -452,10 +477,28 @@ static int ndw_status_json(char *out, size_t len, const char *state)
     uint8_t mac[6] = {0};
     esp_wifi_get_mac(WIFI_IF_STA, mac);
 
+    /*
+     * The uplink, reported beside the WiFi details.
+     *
+     * A box on WiFi that publishes nothing is the failure an installer cannot
+     * diagnose: the light is green, the network is fine, and the problem is a
+     * broker address or a certificate they cannot see. Showing which broker it
+     * is using, whether it is connected, why not, and how much is waiting to
+     * be sent turns that into something readable while they are still there.
+     *
+     * Queue depth is the part that distinguishes "nothing to send" from
+     * "sending is failing" — a growing queue on a connected box means the link
+     * is up but not keeping up.
+     */
     return snprintf(out, len,
                     "{\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
-                    "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d}",
-                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
+                    "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d,"
+                    "\"uplink\":{\"broker\":\"%s\",\"connected\":%s,"
+                    "\"error\":\"%s\",\"queued\":%u,\"sent\":%lu}}",
+                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
+                    ndw_uplink_broker(), ndw_uplink_connected() ? "true" : "false",
+                    ndw_uplink_last_error(), (unsigned)ndw_queue_depth(),
+                    (unsigned long)ndw_scan_count());
 }
 
 static void ndw_notify_status(const char *status)
@@ -464,7 +507,9 @@ static void ndw_notify_status(const char *status)
         return;
     }
 
-    char body[192];
+    /* Fits the broker URL (up to 128) plus the rest, and stays under the
+       517-byte ATT MTU Chrome negotiates. */
+    char body[384];
     int n = ndw_status_json(body, sizeof(body), status);
     if (n <= 0) {
         return;
@@ -509,7 +554,9 @@ static int on_status_read(uint16_t conn, uint16_t attr, struct ble_gatt_access_c
                         : s_ssid[0]      ? NDW_STATUS_FAILED
                                          : "unprovisioned";
 
-    char body[192];
+    /* Fits the broker URL (up to 128) plus the rest, and stays under the
+       517-byte ATT MTU Chrome negotiates. */
+    char body[384];
     int n = ndw_status_json(body, sizeof(body), state);
     if (n <= 0) {
         return BLE_ATT_ERR_UNLIKELY;
@@ -548,6 +595,11 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
      * a router shows up on the network as something a person recognises.
      */
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
+    /*
+     * Optional, and provisioned for the same reason the SSID is: where the
+     * broker lives is a property of the site, not of the firmware.
+     */
+    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
 
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0' || !cJSON_IsString(pass)) {
         ESP_LOGW(TAG, "provisioning payload missing ssid or password");
@@ -561,6 +613,9 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     strlcpy(pass_buf, pass->valuestring, sizeof(pass_buf));
     if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
         ndw_set_hostname(name->valuestring);
+    }
+    if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
+        ndw_uplink_set_broker(broker->valuestring);
     }
     cJSON_Delete(doc);
 
@@ -781,14 +836,16 @@ static void ndw_advertise(void)
 /*
  * A beacon arrived.
  *
- * Logged and shown on the light for now. This is where MQTT publication goes
- * once the uplink exists — the router has the frame, its own EUI and the RSSI
- * it heard it at, which is everything a gateway contributes to a reading.
+ * Runs on the NimBLE host task, so it does no I/O: publish() queues the frame
+ * and returns, and the sender task puts it on the wire. A socket write here
+ * would stall the radio behind the network, dropping the beacons that arrive
+ * while it waited.
  */
 static void on_frame(const ndw_frame_t *frame)
 {
     ESP_LOGI(TAG, "beacon %s kind %u count %" PRIu32 " rssi %d", frame->eui, frame->kind,
              frame->counter, frame->rssi);
+    ndw_uplink_publish(frame);
     /* One pulse per frame, overlaid on whatever the light is showing, so a
        relaying router still reads as online between beacons. */
     ndw_status_pulse();
@@ -809,6 +866,7 @@ static void on_host_sync(void)
      * is for, so the two share the radio with listening as the default.
      */
     ndw_scan_start(on_frame);
+    ndw_telemetry_start(s_eui);
 
     ESP_LOGI(TAG, "ready — hold the button for 3s to pair");
     ndw_led_t resting = s_joined ? NDW_LED_ONLINE : NDW_LED_IDLE;
@@ -845,6 +903,16 @@ void app_main(void)
     ndw_status_init();
     ndw_derive_eui();
     ndw_wifi_init();
+    /*
+     * Before the uplink, because push() is a no-op until the queue exists and
+     * a frame decoded in the gap would be silently lost. Nothing sends yet —
+     * the sender waits on an empty queue.
+     */
+    ndw_queue_start();
+    // Before the uplink, so the subscribe that runs on connect knows which
+    // gateway it is listening for.
+    ndw_command_init(s_eui);
+    ndw_uplink_init(s_eui);
 
     /*
      * Rejoin a known network before BLE comes up, so a box that has been
