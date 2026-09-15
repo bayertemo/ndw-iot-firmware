@@ -5,20 +5,31 @@
 
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "nvs.h"
 
 static const char *TAG = "ndw-uplink";
 
 /*
  * Where the broker lives.
  *
- * A compiled-in default rather than a provisioned setting, for now. It is the
- * one piece of configuration a box cannot discover for itself, and putting it
- * in the BLE provisioning payload is the right answer — but that is a change
- * to the contract on both sides, and this needs to work first.
+ * Provisioned, not compiled in. It is the one piece of configuration a box
+ * cannot discover for itself, and it belongs beside the WiFi credentials for
+ * the same reason they do: it is a property of the site, set by whoever is
+ * installing the box, and a firmware rebuild to change it would mean a site
+ * visit with a laptop and a cable.
+ *
+ * The compiled value is only a fallback for a box provisioned before the
+ * field existed, or one whose installer left it blank.
  */
 #ifndef NDW_MQTT_URI
 #define NDW_MQTT_URI "mqtt://emqx.ndw.ai:1883"
 #endif
+
+/* Long enough for mqtts://host.example.com:8883 and room to spare. */
+#define BROKER_MAX 128
+
+#define NVS_NAMESPACE "ndw"
+#define NVS_KEY_BROKER "broker"
 
 /*
  * QoS 0.
@@ -34,6 +45,7 @@ static const char *TAG = "ndw-uplink";
 static esp_mqtt_client_handle_t s_client;
 static volatile bool s_connected;
 static char s_gateway[17];
+static char s_broker[BROKER_MAX];
 
 static void on_mqtt_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *data)
 {
@@ -65,12 +77,66 @@ static void on_mqtt_event(void *handler_args, esp_event_base_t base, int32_t eve
     }
 }
 
+/* Reads the provisioned broker, falling back to the compiled default. */
+static void load_broker(void)
+{
+    nvs_handle_t nvs;
+    size_t len = sizeof(s_broker);
+
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        if (nvs_get_str(nvs, NVS_KEY_BROKER, s_broker, &len) == ESP_OK && s_broker[0] != '\0') {
+            nvs_close(nvs);
+            return;
+        }
+        nvs_close(nvs);
+    }
+
+    strlcpy(s_broker, NDW_MQTT_URI, sizeof(s_broker));
+}
+
+void ndw_uplink_set_broker(const char *uri)
+{
+    if (uri == NULL || uri[0] == '\0') {
+        return;
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGW(TAG, "could not store the broker address");
+        return;
+    }
+    nvs_set_str(nvs, NVS_KEY_BROKER, uri);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "broker set to %s", uri);
+
+    /*
+     * Reconnect rather than wait for a reboot. A technician who has just
+     * typed an address expects the box to try it while they are still
+     * standing there — and if it is wrong, to say so before they leave.
+     */
+    bool changed = strcmp(uri, s_broker) != 0;
+    strlcpy(s_broker, uri, sizeof(s_broker));
+
+    if (changed && s_client != NULL) {
+        esp_mqtt_client_stop(s_client);
+        esp_mqtt_set_config(s_client, &(esp_mqtt_client_config_t){
+                                          .broker.address.uri = s_broker,
+                                          .credentials.client_id = s_gateway,
+                                          .session.keepalive = 60,
+                                      });
+        esp_mqtt_client_start(s_client);
+    }
+}
+
 void ndw_uplink_init(const char *gateway_eui)
 {
     strlcpy(s_gateway, gateway_eui, sizeof(s_gateway));
+    load_broker();
 
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = NDW_MQTT_URI,
+        .broker.address.uri = s_broker,
         /*
          * The client id is the gateway's EUI, which is unique by
          * construction. It matters: a broker closes the older connection when
@@ -102,7 +168,7 @@ void ndw_uplink_init(const char *gateway_eui)
         return;
     }
 
-    ESP_LOGI(TAG, "uplink to %s as %s", NDW_MQTT_URI, s_gateway);
+    ESP_LOGI(TAG, "uplink to %s as %s", s_broker, s_gateway);
 }
 
 /*

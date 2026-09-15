@@ -44,5 +44,14 @@ void ndw_uplink_init(const char *gateway_eui);
  */
 void ndw_uplink_publish(const ndw_frame_t *frame);
 
+/**
+ * Sets the broker, persists it, and reconnects.
+ *
+ * Provisioned beside the WiFi credentials: it is a property of the site, not
+ * of the firmware, and needing a rebuild to change it would mean a site visit
+ * with a laptop and a cable.
+ */
+void ndw_uplink_set_broker(const char *uri);
+
 /** Whether the broker link is currently up. */
 bool ndw_uplink_connected(void);

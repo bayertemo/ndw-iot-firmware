@@ -549,6 +549,11 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
      * a router shows up on the network as something a person recognises.
      */
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
+    /*
+     * Optional, and provisioned for the same reason the SSID is: where the
+     * broker lives is a property of the site, not of the firmware.
+     */
+    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
 
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0' || !cJSON_IsString(pass)) {
         ESP_LOGW(TAG, "provisioning payload missing ssid or password");
@@ -562,6 +567,9 @@ static int on_wifi_write(uint16_t conn, uint16_t attr, struct ble_gatt_access_ct
     strlcpy(pass_buf, pass->valuestring, sizeof(pass_buf));
     if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
         ndw_set_hostname(name->valuestring);
+    }
+    if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
+        ndw_uplink_set_broker(broker->valuestring);
     }
     cJSON_Delete(doc);
 
