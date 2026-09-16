@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -55,6 +56,16 @@ static const char *TAG = "ndw-prov";
  * and finds more.
  */
 #define SCAN_DWELL_MS 300
+
+/*
+ * How long to let a new broker prove itself before answering.
+ *
+ * A TLS handshake over WebSocket against a host that has to be resolved
+ * first is comfortably a second or two. Long enough to see it work; short
+ * enough that a wrong address is reported while somebody is still looking at
+ * the screen.
+ */
+#define BROKER_SETTLE_MS 8000
 
 static void reply(const char *json)
 {
@@ -319,18 +330,16 @@ static void on_wifi(const cJSON *doc)
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(doc, "ssid");
     const cJSON *pass = cJSON_GetObjectItemCaseSensitive(doc, "password");
 
-    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
 
     /*
      * Checked together, and all of them, before anything is applied.
      *
      * Applying as we validate would leave a board carrying half a change when
-     * the other half is refused — a new broker set against a network it was
-     * never told how to reach. Nothing here touches the radio until every
+     * the other half is refused. Nothing here touches the radio until every
      * field has passed.
      */
-    ndw_fault_t faults[4];
+    ndw_fault_t faults[3];
     int count = 0;
 
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0') {
@@ -347,25 +356,6 @@ static void on_wifi(const cJSON *doc)
         faults[count++] = (ndw_fault_t){"password", "That passphrase is longer than WPA2 allows."};
     }
 
-    /*
-     * The broker, checked rather than taken on trust.
-     *
-     * A board given an address it cannot parse joins the network, reports
-     * itself healthy and publishes nothing — the failure an installer cannot
-     * see, because everything else looks right. Refusing it here costs one
-     * round trip; accepting it costs a site visit.
-     */
-    if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
-        const char *url = broker->valuestring;
-        if (strncmp(url, "ws://", 5) != 0 && strncmp(url, "wss://", 6) != 0 &&
-            strncmp(url, "mqtt://", 7) != 0 && strncmp(url, "mqtts://", 8) != 0) {
-            faults[count++] =
-                (ndw_fault_t){"broker", "A broker address starts with wss://, ws://, mqtt:// or mqtts://."};
-        } else if (strlen(url) >= NDW_BROKER_MAX) {
-            faults[count++] = (ndw_fault_t){"broker", "That broker address is too long."};
-        }
-    }
-
     if (count > 0) {
         reply_faults("wifi", faults, count);
         return;
@@ -375,10 +365,6 @@ static void on_wifi(const cJSON *doc)
        name the person chose rather than the default. */
     if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
         ndw_set_hostname(name->valuestring);
-    }
-
-    if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
-        ndw_uplink_set_broker(broker->valuestring);
     }
 
     char ssid_buf[SSID_MAX];
@@ -398,6 +384,129 @@ static void on_wifi(const cJSON *doc)
     /* The full status either way: a failure that names the cause — bad-auth
        against not-found — is the difference between retyping a password and
        walking closer to the access point. */
+    on_status();
+}
+
+/* ------------------------------------------------------------------ uplink */
+
+/*
+ * Points the box at a broker.
+ *
+ * Its own command, separate from the network. They are separate decisions:
+ * which WiFi to join is about this box and this building, while where it
+ * publishes is about the platform and is usually already right. Bundling them
+ * meant a person changing one had to restate the other — and meant a broker
+ * could not be corrected at all without also knowing the WiFi passphrase.
+ *
+ * Applied straight away rather than tried, unlike the remote path. Somebody
+ * is standing here with a cable: if the address is wrong they will see it in
+ * the status and can type another, which is the thing a box on a roof cannot
+ * rely on.
+ */
+static void on_uplink(const cJSON *doc)
+{
+    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
+
+    ndw_fault_t faults[1];
+    int count = 0;
+
+    if (!cJSON_IsString(broker) || broker->valuestring[0] == '\0') {
+        faults[count++] = (ndw_fault_t){"broker", "A broker address is required."};
+    } else {
+        const char *url = broker->valuestring;
+        /*
+         * wss:// only, and checked rather than taken on trust.
+         *
+         * The platform's broker is reached over TLS WebSocket and nothing
+         * else: mqtt:// on 1883 is plaintext, and ws:// would carry
+         * credentials in the clear the moment the broker starts checking
+         * them. Refusing the others here is narrower than the transport can
+         * do and exactly as wide as we want it used.
+         *
+         * A board given an address it cannot parse joins the network, reports
+         * itself healthy and publishes nothing — the failure an installer
+         * cannot see, because everything else looks right.
+         */
+        if (strncmp(url, "wss://", 6) != 0) {
+            faults[count++] =
+                (ndw_fault_t){"broker", "A broker address must start with wss://."};
+        } else if (strlen(url) < 8 || strchr(url + 6, '.') == NULL) {
+            /* Something has to follow the scheme, and a host without a dot is
+               not a name this box can resolve on a customer's network. */
+            faults[count++] = (ndw_fault_t){"broker", "That does not look like a broker address."};
+        } else if (strlen(url) >= NDW_BROKER_MAX) {
+            faults[count++] = (ndw_fault_t){"broker", "That broker address is too long."};
+        }
+    }
+
+    if (count > 0) {
+        reply_faults("uplink", faults, count);
+        return;
+    }
+
+    /*
+     * Kept, so a failure has somewhere to go back to.
+     *
+     * Read before the change rather than after, because after is too late:
+     * the new address has already replaced it.
+     */
+    char previous[NDW_BROKER_MAX];
+    strlcpy(previous, ndw_uplink_broker(), sizeof(previous));
+
+    ndw_uplink_set_broker(broker->valuestring);
+
+    /*
+     * Wait for the connection to resolve before answering.
+     *
+     * Replying the instant the address is stored says only that it was
+     * spelled correctly. The question a person actually has — does it work —
+     * is answered a second or two later, and a console left to guess at that
+     * either reports success too early or polls until it gives up.
+     *
+     * Polled rather than driven by an event because the MQTT client owns its
+     * own task and reports through these accessors; a command that blocks its
+     * own console task for a few seconds costs nothing, since nothing else
+     * can be asked meanwhile anyway.
+     */
+    int64_t deadline = esp_timer_get_time() + (BROKER_SETTLE_MS * 1000LL);
+    while (esp_timer_get_time() < deadline) {
+        if (ndw_uplink_connected()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (!ndw_uplink_connected()) {
+        const char *why = ndw_uplink_last_error();
+        char message[96];
+        snprintf(message, sizeof(message), "%s — kept the previous address",
+                 why != NULL && why[0] != '\0' ? why : "could not connect");
+
+        /*
+         * Back to what was working.
+         *
+         * A box left on an address it cannot reach publishes nothing until
+         * somebody returns to it, and the readings it takes meanwhile go
+         * nowhere. Keeping the typed value would preserve one person's
+         * typing at the cost of the thing the box is for.
+         *
+         * Not reported as a second failure if the old address also fails to
+         * come back: the person is being told the new one did not work, and
+         * a second sentence about the old one would not change what they do
+         * next.
+         */
+        if (previous[0] != '\0') {
+            ndw_uplink_set_broker(previous);
+        }
+
+        /* Against the broker field, so it lands where the address was typed. */
+        ndw_fault_t failure[1] = {{"broker", message}};
+        reply_faults("uplink", failure, 1);
+        return;
+    }
+
+    /* The full status, so the console can show the connection rather than
+       only that the address was accepted. */
     on_status();
 }
 
@@ -440,6 +549,8 @@ static void dispatch(char *line)
         on_scan();
     } else if (strcmp(cmd->valuestring, "wifi") == 0) {
         on_wifi(doc);
+    } else if (strcmp(cmd->valuestring, "uplink") == 0) {
+        on_uplink(doc);
     } else if (strcmp(cmd->valuestring, "forget") == 0) {
         on_forget();
     } else {

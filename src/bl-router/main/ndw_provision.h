@@ -15,6 +15,7 @@
  *   {"cmd":"scan"}                         -> #NDW {"ok":true,"networks":[...]}
  *   {"cmd":"wifi","ssid":"..","password":".."}
  *                                          -> #NDW {"ok":true,"state":"connected"}
+ *   {"cmd":"uplink","broker":"wss://.."}   -> #NDW {"ok":true,...}
  *   {"cmd":"status"}                       -> #NDW {"ok":true,...}
  *
  * Sharing the stream with logs rather than silencing them is the point: a

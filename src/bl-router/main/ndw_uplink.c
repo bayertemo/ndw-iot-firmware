@@ -311,6 +311,18 @@ static void apply_broker(void)
         return;
     }
 
+    /*
+     * Down until the new address proves otherwise.
+     *
+     * esp_mqtt_client_stop() raises no DISCONNECTED event, so nothing else
+     * clears this — and a caller asking "did that work?" a moment later would
+     * be told yes by the connection that was just torn down. That is exactly
+     * what provisioning asks, and it reported an unreachable broker as
+     * connected in under a second.
+     */
+    s_connected = false;
+    s_error = "";
+
     esp_mqtt_client_stop(s_client);
     /* Same bundle as init: a broker typed into the console is exactly the
        case that needs it, and omitting it here would mean the default works
