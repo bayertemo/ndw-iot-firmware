@@ -25,5 +25,5 @@
     }
   ],
   "$comment2": "ota-data-initial.bin is 8KB of 0xff \u2014 the erased state that tells the bootloader no OTA slot has been selected, so boot ota_0. It is only needed because the console flashes with eraseAll false: a board carrying stale otadata from earlier firmware would otherwise boot a slot that no longer holds a valid image.",
-  "revision": "0.1.0"
+  "revision": "0.2.0"
 }
