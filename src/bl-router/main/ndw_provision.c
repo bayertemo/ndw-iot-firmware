@@ -79,6 +79,55 @@ static void reply_error(const char *code, const char *detail)
     reply(body);
 }
 
+/*
+ * One problem with one setting, named so a console can put it where the
+ * person typed it.
+ *
+ * `field` is the wire name of the setting — "ssid", "password", "broker" —
+ * rather than a section, because a section is a decision about layout and
+ * this end should not be making it. A console that groups two fields into one
+ * panel can group their problems too; one that lays them out flat still knows
+ * which input to mark.
+ */
+typedef struct {
+    const char *field;
+    const char *message;
+} ndw_fault_t;
+
+/*
+ * Every problem at once, rather than the first.
+ *
+ * Reporting one at a time means a person fixes it, saves, and is told about
+ * the next — which for a form with a name, a passphrase and a broker is three
+ * round trips through a board that takes twenty seconds to answer. Collecting
+ * them costs nothing here and is the difference between one correction and
+ * several.
+ */
+static void reply_faults(const char *code, const ndw_fault_t *faults, int count)
+{
+    char body[512];
+    int n = snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\",\"faults\":[", code);
+
+    for (int i = 0; i < count && n > 0 && n < (int)sizeof(body); i++) {
+        int w = snprintf(body + n, sizeof(body) - n, "%s{\"field\":\"%s\",\"message\":\"%s\"}",
+                         i == 0 ? "" : ",", faults[i].field, faults[i].message);
+        if (w <= 0 || n + w >= (int)sizeof(body)) {
+            break;
+        }
+        n += w;
+    }
+
+    if (n > 0 && n + 4 < (int)sizeof(body)) {
+        /* `detail` as well, so a reader that knows nothing of faults still has
+           something to show rather than an empty error. */
+        snprintf(body + n, sizeof(body) - n, "],\"detail\":\"%s\"}",
+                 count > 0 ? faults[0].message : "");
+        reply(body);
+    } else {
+        reply_error(code, count > 0 ? faults[0].message : NULL);
+    }
+}
+
 /* ------------------------------------------------------------------- hello */
 
 /*
@@ -270,25 +319,64 @@ static void on_wifi(const cJSON *doc)
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(doc, "ssid");
     const cJSON *pass = cJSON_GetObjectItemCaseSensitive(doc, "password");
 
+    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
+
+    /*
+     * Checked together, and all of them, before anything is applied.
+     *
+     * Applying as we validate would leave a board carrying half a change when
+     * the other half is refused — a new broker set against a network it was
+     * never told how to reach. Nothing here touches the radio until every
+     * field has passed.
+     */
+    ndw_fault_t faults[4];
+    int count = 0;
+
     if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0') {
-        reply_error("wifi", "ssid is required");
-        return;
+        faults[count++] = (ndw_fault_t){"ssid", "A network name is required."};
+    } else if (strlen(ssid->valuestring) >= SSID_MAX) {
+        faults[count++] = (ndw_fault_t){"ssid", "That network name is too long for the radio."};
     }
+
     /* An open network has no passphrase, so an empty string is valid — but a
        missing key is a malformed command rather than an open network. */
     if (!cJSON_IsString(pass)) {
-        reply_error("wifi", "password is required");
+        faults[count++] = (ndw_fault_t){"password", "A passphrase is required, even if empty."};
+    } else if (strlen(pass->valuestring) >= PASS_MAX) {
+        faults[count++] = (ndw_fault_t){"password", "That passphrase is longer than WPA2 allows."};
+    }
+
+    /*
+     * The broker, checked rather than taken on trust.
+     *
+     * A board given an address it cannot parse joins the network, reports
+     * itself healthy and publishes nothing — the failure an installer cannot
+     * see, because everything else looks right. Refusing it here costs one
+     * round trip; accepting it costs a site visit.
+     */
+    if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
+        const char *url = broker->valuestring;
+        if (strncmp(url, "ws://", 5) != 0 && strncmp(url, "wss://", 6) != 0 &&
+            strncmp(url, "mqtt://", 7) != 0 && strncmp(url, "mqtts://", 8) != 0) {
+            faults[count++] =
+                (ndw_fault_t){"broker", "A broker address starts with wss://, ws://, mqtt:// or mqtts://."};
+        } else if (strlen(url) >= NDW_BROKER_MAX) {
+            faults[count++] = (ndw_fault_t){"broker", "That broker address is too long."};
+        }
+    }
+
+    if (count > 0) {
+        reply_faults("wifi", faults, count);
         return;
     }
 
     /* Optional, and applied before the join so the DHCP lease carries the
        name the person chose rather than the default. */
-    const cJSON *name = cJSON_GetObjectItemCaseSensitive(doc, "name");
     if (cJSON_IsString(name) && name->valuestring[0] != '\0') {
         ndw_set_hostname(name->valuestring);
     }
 
-    const cJSON *broker = cJSON_GetObjectItemCaseSensitive(doc, "broker");
     if (cJSON_IsString(broker) && broker->valuestring[0] != '\0') {
         ndw_uplink_set_broker(broker->valuestring);
     }

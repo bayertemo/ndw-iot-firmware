@@ -47,7 +47,7 @@ static const char *TAG = "ndw-uplink";
 #endif
 
 /* Long enough for mqtts://host.example.com:8883 and room to spare. */
-#define BROKER_MAX 128
+#define BROKER_MAX NDW_BROKER_MAX
 
 #define NVS_NAMESPACE "ndw"
 #define NVS_KEY_BROKER "broker"

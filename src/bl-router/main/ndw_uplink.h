@@ -58,6 +58,15 @@ void ndw_uplink_publish(const ndw_frame_t *frame);
  * Applied outright, with no going back — for the BLE path, where somebody is
  * standing at the box and can correct a mistake on the spot.
  */
+/*
+ * The longest broker address the box will hold.
+ *
+ * In the header because provisioning checks a candidate against it before
+ * handing it over: a truncated URL is worse than a refused one, since it
+ * would look accepted and connect to nothing.
+ */
+#define NDW_BROKER_MAX 128
+
 void ndw_uplink_set_broker(const char *uri);
 
 /**
