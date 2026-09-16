@@ -1031,7 +1031,8 @@ static void ndw_advertise(void)
  */
 static void on_frame(const ndw_frame_t *frame)
 {
-    ESP_LOGI(TAG, "beacon %s kind %u count %" PRIu32 " rssi %d", frame->eui, frame->kind,
+    ESP_LOGI(TAG, "beacon %s v%u kind %u count %" PRIu32 " rssi %d", frame->eui, frame->version,
+             frame->kind,
              frame->counter, frame->rssi);
     ndw_uplink_publish(frame);
     /* One pulse per frame, overlaid on whatever the light is showing, so a

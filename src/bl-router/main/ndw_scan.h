@@ -16,18 +16,41 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ndw_beacon.h"
+
 /** One beacon, as read off the air. */
 typedef struct {
     /** Sixteen lowercase hex characters, matching the printed identifier. */
     char eui[17];
     /** What kind of device sent it. */
     uint8_t kind;
-    /** The sensor's own count. Ingest dedups on (eui, counter). */
+    /** Beacon layout: 1 is plaintext, 2 is sealed. */
+    uint8_t version;
+    /**
+     * The sensor's own count. Ingest dedups on (eui, counter).
+     *
+     * Readable on both versions because it lives in the clear header, which
+     * is what lets this router suppress the repeats of one press without
+     * holding any key.
+     */
     uint32_t counter;
-    /** Seconds since the sensor booted. */
-    uint32_t uptime;
-    /** 0-100, or 0xff when the device cannot measure it. */
-    uint8_t battery;
+    /**
+     * The reading, exactly as it came off the air: five bytes at offset 16,
+     * plus a four-byte tag on version 2.
+     *
+     * Carried rather than decoded. On a sealed beacon these bytes are
+     * ciphertext, and this router has no key — by design, since a gateway
+     * that could read its neighbours' readings could also forge them. On a
+     * plaintext beacon they are the fields themselves, and carrying them
+     * unread costs nothing.
+     *
+     * Copying them verbatim is what makes the tag mean anything downstream.
+     * Decoding the fields and re-encoding them, which this router used to do,
+     * would produce the same numbers and a tag that no longer matched.
+     */
+    uint8_t sealed[NDW_SEALED_LEN + NDW_TAG_LEN];
+    /** How much of `sealed` is real: 5 on version 1, 9 on version 2. */
+    uint8_t sealed_len;
     /** dBm as this router heard it — the only field the sensor cannot know. */
     int8_t rssi;
 } ndw_frame_t;

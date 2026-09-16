@@ -506,23 +506,39 @@ void ndw_uplink_publish(const ndw_frame_t *frame)
     }
 
     /*
-     * The payload the application layer decodes: the counter, then uptime and
-     * battery. The network layer does not interpret any of it — that is the
-     * whole point of the layering, and it is why the counter travels in the
-     * payload as well as in fCnt.
+     * The payload the application layer decodes: the kind, then the reading
+     * exactly as it came off the air.
+     *
+     * Relayed, not rebuilt. This used to decode the counter, uptime and
+     * battery out of the beacon and write them back out here, which produced
+     * identical bytes for a plaintext beacon and would silently destroy a
+     * sealed one — the tag authenticates the bytes the sensor produced, and
+     * re-encoding them from parsed fields breaks it even when every number
+     * survives. Copying is both simpler and the only thing that can work.
+     *
+     * The network layer still interprets none of it, which is the whole point
+     * of the layering and why the counter travels in the payload as well as
+     * in fCnt.
+     *
+     * The beacon version rides in fPort, which is what that field is for in
+     * the envelope this borrows: the number that tells an application which
+     * layout the bytes are in. Without it the platform would have to guess
+     * from the length whether a payload is sealed, and a guess is exactly
+     * what an authentication check must not rest on.
      */
-    uint8_t raw[9];
+    uint8_t raw[5 + sizeof(frame->sealed)];
     raw[0] = frame->kind;
+    /* The counter, from the clear header. It is the nonce, so the platform
+       needs it to decrypt the rest — and putting it here keeps the payload
+       self-contained rather than making a decoder reach into fCnt. */
     for (int i = 0; i < 4; i++) {
         raw[1 + i] = (uint8_t)((frame->counter >> (8 * i)) & 0xff);
     }
-    for (int i = 0; i < 3; i++) {
-        raw[5 + i] = (uint8_t)((frame->uptime >> (8 * i)) & 0xff);
-    }
-    raw[8] = frame->battery;
+    memcpy(&raw[5], frame->sealed, frame->sealed_len);
+    size_t raw_len = 5 + frame->sealed_len;
 
-    char payload[16];
-    base64(raw, sizeof(raw), payload, sizeof(payload));
+    char payload[24];
+    base64(raw, raw_len, payload, sizeof(payload));
 
     /*
      * ChirpStack's envelope, with the LoRaWAN-only fields absent. No time
@@ -535,9 +551,11 @@ void ndw_uplink_publish(const ndw_frame_t *frame)
     int n = snprintf(body, sizeof(body),
                      "{\"deviceInfo\":{\"devEui\":\"%s\"},"
                      "\"fCnt\":%lu,"
+                     "\"fPort\":%u,"
                      "\"data\":\"%s\","
                      "\"rxInfo\":[{\"gatewayId\":\"%s\",\"rssi\":%d}]}",
-                     frame->eui, (unsigned long)frame->counter, payload, s_gateway, frame->rssi);
+                     frame->eui, (unsigned long)frame->counter, frame->version, payload, s_gateway,
+                     frame->rssi);
     if (n <= 0 || n >= (int)sizeof(body)) {
         ESP_LOGW(TAG, "envelope did not fit; dropping the frame");
         return;

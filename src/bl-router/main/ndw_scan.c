@@ -52,12 +52,26 @@ static bool parse_frame(const struct ble_hs_adv_fields *fields, int8_t rssi, ndw
     }
 
     /*
-     * A newer sensor may lay the payload out differently, and reading it with
-     * this firmware's offsets would produce a well-formed frame full of wrong
-     * numbers — worse than dropping it, because nothing downstream could tell.
+     * Two layouts are on the air. Version 1 sends the reading in the clear;
+     * version 2 seals it under a key this router does not have and appends a
+     * tag. Both are relayed, and neither is interpreted beyond the header.
+     *
+     * Any other version is dropped rather than guessed at: reading an unknown
+     * layout with these offsets would produce a well-formed frame full of
+     * wrong numbers, which is worse than dropping it because nothing
+     * downstream could tell.
      */
-    if (p[NDW_OFF_VERSION] != NDW_BEACON_VERSION) {
-        ESP_LOGD(TAG, "ignoring beacon version %u", p[NDW_OFF_VERSION]);
+    uint8_t version = p[NDW_OFF_VERSION];
+    size_t want = NDW_BEACON_LEN;
+    if (version == NDW_BEACON_VERSION_SEALED) {
+        want = NDW_BEACON_SEALED_LEN;
+    } else if (version != NDW_BEACON_VERSION) {
+        ESP_LOGD(TAG, "ignoring beacon version %u", version);
+        return false;
+    }
+
+    if (fields->mfg_data_len < want) {
+        ESP_LOGD(TAG, "beacon version %u is short: %u bytes", version, fields->mfg_data_len);
         return false;
     }
 
@@ -68,13 +82,23 @@ static bool parse_frame(const struct ble_hs_adv_fields *fields, int8_t rssi, ndw
     out->eui[16] = '\0';
 
     out->kind = p[NDW_OFF_KIND];
+    out->version = version;
+
+    /* From the clear header on both versions, which is what lets the repeat
+       suppression below work without a key. */
     out->counter = (uint32_t)p[NDW_OFF_COUNTER] | ((uint32_t)p[NDW_OFF_COUNTER + 1] << 8) |
                    ((uint32_t)p[NDW_OFF_COUNTER + 2] << 16) |
                    ((uint32_t)p[NDW_OFF_COUNTER + 3] << 24);
-    out->uptime = (uint32_t)p[NDW_OFF_UPTIME] | ((uint32_t)p[NDW_OFF_UPTIME + 1] << 8) |
-                  ((uint32_t)p[NDW_OFF_UPTIME + 2] << 16) |
-                  ((uint32_t)p[NDW_OFF_UPTIME + 3] << 24);
-    out->battery = p[NDW_OFF_BATTERY];
+
+    /* The reading, copied and not read: uptime and battery, plus the tag on
+       version 2. The tag travels with the bytes it authenticates, so
+       splitting them here would only give the next hop two things to
+       reunite. */
+    out->sealed_len = (version == NDW_BEACON_VERSION_SEALED)
+                          ? (uint8_t)(NDW_SEALED_LEN + NDW_TAG_LEN)
+                          : (uint8_t)NDW_SEALED_LEN;
+    memcpy(out->sealed, &p[NDW_OFF_UPTIME], out->sealed_len);
+
     out->rssi = rssi;
 
     return true;

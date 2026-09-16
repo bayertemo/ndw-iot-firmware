@@ -22,3 +22,30 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Provisioning happens over the same cable that flashed the board, so stdin
+# has to arrive on the USB peripheral rather than on UART0's pins. The button
+# has nothing to provision, but the console still answers `hello` — which is
+# how the flasher learns the EUI it needs to claim the device.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Sleep between presses.
+#
+# The board spends essentially all its life waiting for a finger: a press
+# lights the radio for ten seconds and everything after that is idle. Without
+# this the CPU runs at full clock doing nothing but polling a GPIO, which on
+# a coin cell is the whole battery.
+#
+# Tickless idle is what actually stops the clock — power management alone only
+# lets the frequency drop, and a 20ms tick would wake it 50 times a second
+# regardless.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# The radio has to stay up while it is broadcasting, and light sleep would
+# take it down mid-advertisement. NimBLE asks for a power lock around its own
+# activity, which is what makes the two coexist.
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y

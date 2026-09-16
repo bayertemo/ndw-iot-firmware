@@ -35,13 +35,12 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
+#include "mbedtls/ccm.h"
+
 #include "ndw_beacon.h"
+#include "ndw_console.h"
 
 static const char *TAG = "ndw-button";
-
-#ifndef NDW_VERSION
-#define NDW_VERSION "0.0.0-dev"
-#endif
 
 #define BUTTON_GPIO 9
 #define LED_GPIO 8
@@ -58,6 +57,35 @@ static const char *TAG = "ndw-button";
 #define POLL_MS 20
 
 /*
+ * How many agreeing polls make a level real.
+ *
+ * Five at 20ms is 100ms of the line holding still — longer than any contact
+ * bounce and far shorter than a finger. Two was the original value and was
+ * thin: it believed a level after 40ms, which a noisy line can supply.
+ */
+#define STABLE_POLLS 5
+
+/*
+ * The shortest gap between two presses that can both be real.
+ *
+ * Nobody presses a button more than a few times a second, so anything closer
+ * than this is the hardware talking rather than a person. It is the backstop
+ * that makes over-counting impossible rather than merely unlikely: even if
+ * the level filter is defeated, a second count inside this window is refused.
+ *
+ * Worth having because the failure it prevents is unrecoverable. The counter
+ * is the CCM nonce, so a count that races ahead of the presses burns those
+ * numbers — the platform will not accept them again, and the device cannot go
+ * back.
+ *
+ * A board with no button wired to BUTTON_GPIO will float and can log presses
+ * that nobody made. This does not fix that, and is not meant to: a floating
+ * input is a wiring fault, and the honest signal is that the count climbs
+ * while the board sits untouched.
+ */
+#define PRESS_GAP_MS 250
+
+/*
  * How long the counter is broadcast after a press.
  *
  * Long enough that a gateway scanning on a duty cycle cannot miss it — a
@@ -72,6 +100,10 @@ static const char *TAG = "ndw-button";
 #define NVS_KEY_COUNT "count"
 
 static uint8_t s_eui[8];
+/* The same identifier as text, which is what the console reports and what the
+   platform registers. Kept beside the bytes rather than formatted on demand:
+   both forms are read often and neither ever changes. */
+static char s_eui_text[17];
 static uint32_t s_counter;
 static int64_t s_broadcast_until;
 
@@ -98,8 +130,26 @@ static void derive_eui(void)
     s_eui[6] = mac[4];
     s_eui[7] = mac[5];
 
-    ESP_LOGI(TAG, "eui %02x%02x%02xfffe%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4],
-             mac[5]);
+    snprintf(s_eui_text, sizeof(s_eui_text), "%02x%02x%02xfffe%02x%02x%02x", mac[0], mac[1],
+             mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "eui %s", s_eui_text);
+}
+
+/*
+ * Read by the console, which reports both and owns neither.
+ *
+ * The console is a separate module because it has a separate job — a cable,
+ * a line protocol, a key store — and it should not be reaching into this
+ * file's statics to do it.
+ */
+const char *ndw_device_eui(void)
+{
+    return s_eui_text;
+}
+
+uint32_t ndw_device_counter(void)
+{
+    return s_counter;
 }
 
 /* ----------------------------------------------------------------- counter */
@@ -139,13 +189,71 @@ static void store_counter(void)
 
 /* ------------------------------------------------------------------ beacon */
 
+/*
+ * Encrypts the reading in place, and appends the tag.
+ *
+ * The header stays readable and is fed in as associated data, so it is
+ * authenticated without being hidden: a router filters on it holding no key,
+ * and the platform reads the EUI from it to know whose key to try. Changing
+ * one byte of it — relabelling a captured frame as a different device —
+ * invalidates the tag, so "readable" does not mean "editable".
+ *
+ * The nonce is the EUI and the counter, read straight out of the header. CCM
+ * needs a value that never repeats under one key, and that pair is exactly
+ * that: unique per device, and unique per frame because the counter is
+ * monotonic and persisted across reboots. Both are already on the wire, so
+ * the nonce costs no bytes.
+ *
+ * The counter stays in the clear rather than being encrypted with the rest.
+ * It has to: it is the nonce, so a receiver needs it before it can decrypt,
+ * and the router keys its repeat suppression on it while holding no key at
+ * all. Authenticated, not hidden — which is the right trade for a number that
+ * says how many times a button was pressed.
+ *
+ * Returns false when the board has no key, which is not a failure: it is an
+ * unclaimed board, and it falls back to broadcasting version 1 in the clear.
+ */
+static bool seal_payload(uint8_t *payload)
+{
+    const uint8_t *key = ndw_console_key();
+    if (key == NULL) {
+        return false;
+    }
+
+    mbedtls_ccm_context ccm;
+    mbedtls_ccm_init(&ccm);
+
+    bool ok = mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, key, NDW_KEY_LEN * 8) == 0;
+    if (ok) {
+        /* In place: the plaintext and the ciphertext are the same nine bytes,
+           and a scratch buffer would only be a second thing to get wrong. */
+        ok = mbedtls_ccm_encrypt_and_tag(&ccm, NDW_SEALED_LEN, &payload[NDW_OFF_NONCE],
+                                         NDW_NONCE_LEN, payload, NDW_CLEAR_LEN,
+                                         &payload[NDW_OFF_UPTIME], &payload[NDW_OFF_UPTIME],
+                                         &payload[NDW_OFF_TAG], NDW_TAG_LEN) == 0;
+    }
+
+    mbedtls_ccm_free(&ccm);
+
+    if (!ok) {
+        /* The payload is now neither plaintext nor valid ciphertext. Saying so
+           and sending nothing beats sending a frame the platform will count as
+           a forgery attempt. */
+        ESP_LOGE(TAG, "could not seal the reading");
+    }
+    return ok;
+}
+
 static void advertise(void)
 {
-    uint8_t payload[NDW_BEACON_LEN] = {0};
+    /* Sized for the larger of the two: a version 1 frame simply sends fewer
+       of these bytes. */
+    uint8_t payload[NDW_BEACON_SEALED_LEN] = {0};
+    bool sealed = ndw_console_provisioned();
 
     payload[NDW_OFF_COMPANY] = NDW_COMPANY_ID & 0xff;
     payload[NDW_OFF_COMPANY + 1] = (NDW_COMPANY_ID >> 8) & 0xff;
-    payload[NDW_OFF_VERSION] = NDW_BEACON_VERSION;
+    payload[NDW_OFF_VERSION] = sealed ? NDW_BEACON_VERSION_SEALED : NDW_BEACON_VERSION;
     payload[NDW_OFF_KIND] = NDW_KIND_TEST_BUTTON;
 
     /* Big-endian: this is the identifier printed on the box, and reversing it
@@ -165,10 +273,16 @@ static void advertise(void)
        admitted gap — a dashboard would chart it as if it meant something. */
     payload[NDW_OFF_BATTERY] = NDW_BATTERY_UNKNOWN;
 
+    if (sealed) {
+        if (!seal_payload(payload)) {
+            return;
+        }
+    }
+
     struct ble_hs_adv_fields fields = {0};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.mfg_data = payload;
-    fields.mfg_data_len = sizeof(payload);
+    fields.mfg_data_len = sealed ? NDW_BEACON_SEALED_LEN : NDW_BEACON_LEN;
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
@@ -210,42 +324,86 @@ static void advertise(void)
     }
 }
 
+/*
+ * One press: count it, remember it, and broadcast it.
+ *
+ * Shared by the switch and the console's `press` command so the two cannot
+ * drift — a test that exercised a different path from the real one would
+ * prove nothing about the real one.
+ */
+void ndw_device_press(void)
+{
+    s_counter++;
+    store_counter();
+    s_broadcast_until = esp_timer_get_time() + (int64_t)BROADCAST_MS * 1000;
+    ESP_LOGI(TAG, "press %" PRIu32, s_counter);
+    advertise();
+    gpio_set_level(LED_GPIO, 1);
+}
+
 /* ------------------------------------------------------------------ button */
 
 static void button_task(void *arg)
 {
     (void)arg;
 
+    /* The level the last poll saw, and how many polls in a row have agreed
+       with it. A level is believed only once it has held still. */
+    bool seen = false;
+    int held = 0;
+
+    /* The level currently believed, which is what a press is measured
+       against. */
     bool was_down = false;
-    int stable = 0;
+    int64_t last_press = 0;
 
     for (;;) {
         bool down = gpio_get_level(BUTTON_GPIO) == 0;
+        int64_t now = esp_timer_get_time();
 
         /*
          * Counts on the press, not the release: a button that responds when
          * you push it feels immediate, and one that waits for release feels
-         * broken. Two consecutive polls agreeing is what filters the contact
-         * bounce that would otherwise count one push several times.
+         * broken.
+         *
+         * Two filters. A level is believed only after STABLE_POLLS
+         * consecutive polls have agreed with it, and a count is then refused
+         * if the last one was less than PRESS_GAP_MS ago. The first rejects
+         * contact bounce; the second bounds how fast the counter can climb
+         * whatever the line does.
+         *
+         * The run length counts polls that agree with each other, not polls
+         * that disagree with the believed level. Counting the latter — which
+         * this did — means one bouncing poll resets the run, so the run never
+         * accumulates and no press is ever seen. It happened to work only
+         * because the threshold was two.
          */
-        if (down == was_down) {
-            stable = 0;
-        } else if (++stable >= 2) {
-            was_down = down;
-            stable = 0;
-            if (down) {
-                s_counter++;
-                store_counter();
-                s_broadcast_until = esp_timer_get_time() + (int64_t)BROADCAST_MS * 1000;
-                ESP_LOGI(TAG, "press %" PRIu32, s_counter);
-                advertise();
-                gpio_set_level(LED_GPIO, 1);
+        if (down != seen) {
+            seen = down;
+            held = 1;
+        } else if (held < STABLE_POLLS) {
+            held++;
+        }
+
+        if (held >= STABLE_POLLS && seen != was_down) {
+            was_down = seen;
+            if (was_down) {
+                if (last_press != 0 && now - last_press < (int64_t)PRESS_GAP_MS * 1000) {
+                    /* Debug, not warn: on a chattering switch this is the
+                       common case, and at warn level it would bury the log in
+                       exactly the situation where the log matters. */
+                    ESP_LOGD(TAG, "ignoring a bounce %lldms after the last press",
+                             (long long)((now - last_press) / 1000));
+                } else {
+                    last_press = now;
+                    ndw_device_press();
+                }
             }
         }
 
         /* The light follows the broadcast window, so it shows what the radio
            is doing rather than just that a press registered. */
-        if (s_broadcast_until != 0 && esp_timer_get_time() > s_broadcast_until) {
+        if (s_broadcast_until != 0 && now > s_broadcast_until) {
             s_broadcast_until = 0;
             ble_gap_adv_stop();
             gpio_set_level(LED_GPIO, 0);
@@ -280,7 +438,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    ESP_LOGI(TAG, "NDW Test Button %s", NDW_VERSION);
+    ESP_LOGI(TAG, "NDW Test Button %s", NDW_FIRMWARE_VERSION);
 
     derive_eui();
     load_counter();
@@ -310,6 +468,10 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&led));
     gpio_set_level(LED_GPIO, 0);
+
+    /* After derive_eui and load_counter: the console reports both, and a
+       hello arriving in the gap would answer with zeros. */
+    ndw_console_start();
 
     ESP_ERROR_CHECK(nimble_port_init());
     ble_hs_cfg.sync_cb = on_sync;
