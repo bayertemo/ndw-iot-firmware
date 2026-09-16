@@ -54,6 +54,8 @@
 #include "ndw_scan.h"
 #include "ndw_telemetry.h"
 #include "ndw_uplink.h"
+#include "ndw_provision.h"
+#include "ndw_router.h"
 #include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
@@ -68,14 +70,11 @@ static const char *TAG = "ndw-router";
 #define NDW_VERSION "0.0.0-dev"
 #endif
 
+
 /* Where proven credentials live. */
 #define NVS_NAMESPACE "ndw"
 #define NVS_KEY_SSID  "ssid"
 #define NVS_KEY_PASS  "pass"
-
-/* WPA2 limits: 32 bytes of SSID, 63 of passphrase, plus terminators. */
-#define SSID_MAX 33
-#define PASS_MAX 64
 
 /* How long to wait for a join before calling it failed. */
 #define JOIN_TIMEOUT_MS 20000
@@ -92,6 +91,24 @@ static const char *TAG = "ndw-router";
 static EventGroupHandle_t s_wifi_events;
 #define WIFI_JOINED BIT0
 #define WIFI_FAILED BIT1
+
+/*
+ * Serialises everything that drives the radio.
+ *
+ * The join path keeps its state in file statics — the attempt count, the last
+ * failure, the reconfiguring guard — and none of it is per-caller. That was
+ * safe while one task at a time could ask: BLE provisioning ran on the host
+ * task, and the boot path had finished before the host task existed.
+ *
+ * The console broke that. app_main sits inside a join for up to twenty seconds
+ * while rejoining a stored network, and the console task is answering commands
+ * throughout. Two joins interleaved would share one attempt counter and one
+ * failure cause, and report each other's outcome.
+ *
+ * A scan takes it too: the driver will not scan during a join, and a caller
+ * that waits is better than one that gets an error it cannot act on.
+ */
+static SemaphoreHandle_t s_radio_lock;
 
 static char s_eui[NDW_EUI_LEN + 1];
 
@@ -110,11 +127,24 @@ static int s_join_attempts;
  * leaving. A box given new credentials would keep trying the previous ones.
  */
 static volatile bool s_reconfiguring;
+
+/*
+ * Retries a stored network after the attempts for one request run out.
+ *
+ * One-shot and restarted on each failure rather than periodic, so a box that
+ * comes back on the first retry is not still holding a timer. The interval is
+ * long enough not to hammer an access point that is genuinely gone, short
+ * enough that a router finishing a reboot is picked up while someone is still
+ * standing there wondering.
+ */
+#define RETRY_INTERVAL_MS (30 * 1000)
+static TimerHandle_t s_retry_timer;
 /* Set from the disconnect reason, so the reported failure names a cause. */
 static const char *s_last_failure = NDW_STATUS_FAILED;
 
 static void ndw_advertise(void);
 static void ndw_pairing_close(void);
+static bool ndw_wifi_join_locked(const char *ssid, const char *password);
 
 /*
  * How long a pairing window stays open.
@@ -187,7 +217,7 @@ static void ndw_derive_eui(void)
  * rejected or silently mangled by the router, so it is folded here rather
  * than trusted.
  */
-static void ndw_set_hostname(const char *label)
+void ndw_set_hostname(const char *label)
 {
     size_t out = 0;
     out += (size_t)snprintf(s_hostname, sizeof(s_hostname), "NDW-");
@@ -305,9 +335,25 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             return;
         }
 
-        ESP_LOGE(TAG, "join failed (reason %d), giving up", ev->reason);
+        /*
+         * Out of attempts for this request, so whoever asked gets an answer.
+         *
+         * But the radio does not stop trying. An access point that was down,
+         * a router mid-reboot, a band that was briefly too busy — none of
+         * those are permanent, and a box that gave up on them forever would
+         * need a person with a cable to fix something that fixed itself.
+         *
+         * That mattered less when BLE was always listening and a box could be
+         * re-provisioned where it stood. It is the whole difference now:
+         * unattended recovery is the only recovery an installed box has.
+         */
+        ESP_LOGE(TAG, "join failed (reason %d), backing off", ev->reason);
         s_joined = false;
         xEventGroupSetBits(s_wifi_events, WIFI_FAILED);
+
+        if (s_retry_timer != NULL) {
+            xTimerStart(s_retry_timer, 0);
+        }
         return;
     }
 
@@ -315,6 +361,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         const ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "joined, ip " IPSTR, IP2STR(&ev->ip_info.ip));
         s_joined = true;
+        /* Whatever we were backing off from, we are past it. */
+        if (s_retry_timer != NULL) {
+            xTimerStop(s_retry_timer, 0);
+        }
         /* An event, not a wait for the next heartbeat: a join five minutes
            ago and a join just now mean different things. */
         ndw_telemetry_notify(NDW_TELEMETRY_NETWORK);
@@ -327,9 +377,70 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
+/*
+ * Tries a stored network again, after the radio gave up on it.
+ *
+ * Runs on the timer task, which must not block — so this asks the driver to
+ * reconnect and lets the event handler take it from there, rather than
+ * calling the join and waiting twenty seconds inside a timer callback.
+ *
+ * Nothing to do if a console is mid-join: the attempt counter is reset by
+ * whoever is driving, and a reconnect underneath it would spend one of their
+ * retries on the old network.
+ */
+static void on_retry_timer(TimerHandle_t timer)
+{
+    (void)timer;
+
+    if (s_joined || s_reconfiguring) {
+        return;
+    }
+
+    char ssid[SSID_MAX] = {0};
+    char pass[PASS_MAX] = {0};
+    if (!ndw_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        /* Never provisioned, or the credentials were forgotten. Nothing to
+           retry, and no timer to restart — the next provisioning starts it. */
+        return;
+    }
+
+    /*
+     * Put the stored credentials back before reconnecting.
+     *
+     * esp_wifi_connect() uses whatever config the driver is holding, and after
+     * a failed provisioning attempt that is the config that just failed —
+     * so retrying without this re-tries the wrong password forever, which
+     * looks exactly like a network that has genuinely gone away. Found on
+     * hardware: reason 15 (4-way handshake timeout) on every retry, against
+     * an access point that was working.
+     */
+    wifi_config_t cfg = {0};
+    strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+    strlcpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password));
+
+    ESP_LOGI(TAG, "retrying '%s'", ssid);
+    s_join_attempts = 0;
+
+    /* The disconnect this raises is ours, so the handler must not spend a
+       retry reconnecting to what we are replacing. */
+    s_reconfiguring = true;
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    s_reconfiguring = false;
+
+    esp_wifi_connect();
+
+    /* Restarted by the disconnect handler if this fails, rather than made
+       periodic: a box that comes back on the first retry is not left holding
+       a timer. */
+}
+
 static void ndw_wifi_init(void)
 {
     s_wifi_events = xEventGroupCreate();
+    s_radio_lock = xSemaphoreCreateMutex();
+    s_retry_timer = xTimerCreate("ndw-retry", pdMS_TO_TICKS(RETRY_INTERVAL_MS), pdFALSE, NULL,
+                                 on_retry_timer);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -360,7 +471,75 @@ static void ndw_wifi_init(void)
  * once an IP has actually arrived — association alone is not a working
  * network.
  */
-static bool ndw_wifi_join(const char *ssid, const char *password)
+/*
+ * Taken by anything that drives the radio, and held across the whole
+ * operation rather than around each driver call: the state being protected is
+ * the retry bookkeeping between them, not the calls themselves.
+ */
+void ndw_radio_lock(void)
+{
+    if (s_radio_lock != NULL) {
+        xSemaphoreTake(s_radio_lock, portMAX_DELAY);
+    }
+}
+
+void ndw_radio_unlock(void)
+{
+    if (s_radio_lock != NULL) {
+        xSemaphoreGive(s_radio_lock);
+    }
+}
+
+/*
+ * Where provisioning stands, in one word.
+ *
+ * Three states rather than two: a box that has never been told anything is
+ * different from one that was told and could not get on, and a console that
+ * cannot tell them apart would offer to retry credentials that do not exist.
+ */
+const char *ndw_provision_state(void)
+{
+    if (s_joined) {
+        return NDW_STATUS_CONNECTED;
+    }
+    return s_ssid[0] != '\0' ? s_last_failure : "unprovisioned";
+}
+
+const char *ndw_eui(void)
+{
+    return s_eui;
+}
+
+void ndw_forget_credentials(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "could not open nvs to forget credentials");
+        return;
+    }
+
+    /* Erasing the keys rather than the namespace: the press counter and the
+       provisioned broker live here too, and forgetting a network is not the
+       same as forgetting everything. */
+    nvs_erase_key(nvs, NVS_KEY_SSID);
+    nvs_erase_key(nvs, NVS_KEY_PASS);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    s_ssid[0] = '\0';
+    ESP_LOGI(TAG, "credentials forgotten");
+}
+
+bool ndw_wifi_join(const char *ssid, const char *password)
+{
+    ndw_radio_lock();
+    bool joined = ndw_wifi_join_locked(ssid, password);
+    ndw_radio_unlock();
+    return joined;
+}
+
+/* The join itself, with the lock already held. */
+static bool ndw_wifi_join_locked(const char *ssid, const char *password)
 {
     wifi_config_t cfg = {0};
     strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
@@ -418,7 +597,7 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
 
 /* --------------------------------------------------------------- storage */
 
-static bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
@@ -432,7 +611,7 @@ static bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t
     return ok;
 }
 
-static void ndw_store_credentials(const char *ssid, const char *pass)
+void ndw_store_credentials(const char *ssid, const char *pass)
 {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
@@ -457,7 +636,7 @@ static void ndw_store_credentials(const char *ssid, const char *pass)
  * the allocation-free version is both shorter and cannot fail part-way
  * through a notify.
  */
-static int ndw_status_json(char *out, size_t len, const char *state)
+int ndw_status_json(char *out, size_t len, const char *state)
 {
     char ip[16] = "";
     int8_t rssi = 0;
@@ -491,11 +670,20 @@ static int ndw_status_json(char *out, size_t len, const char *state)
      * is up but not keeping up.
      */
     return snprintf(out, len,
-                    "{\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
+                    "{\"state\":\"%s\",\"eui\":\"%s\",\"firmware\":\"%s\","
+                    "\"ssid\":\"%s\",\"ip\":\"%s\","
                     "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d,"
                     "\"uplink\":{\"broker\":\"%s\",\"connected\":%s,"
                     "\"error\":\"%s\",\"queued\":%u,\"sent\":%lu}}",
-                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
+                    /*
+                     * The EUI and the version, because the console needs both
+                     * and neither was here. It claims the box by the EUI, and
+                     * the version is the one question a flasher cannot answer
+                     * for itself: whether the image that booted is the image
+                     * that was just written.
+                     */
+                    state, s_eui, NDW_FIRMWARE_VERSION, s_ssid, ip,
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
                     ndw_uplink_broker(), ndw_uplink_connected() ? "true" : "false",
                     ndw_uplink_last_error(), (unsigned)ndw_queue_depth(),
                     (unsigned long)ndw_scan_count());
@@ -913,6 +1101,17 @@ void app_main(void)
     // gateway it is listening for.
     ndw_command_init(s_eui);
     ndw_uplink_init(s_eui);
+
+    /*
+     * Before the rejoin below, which blocks for up to twenty seconds.
+     *
+     * The browser opens the port as soon as the board reboots into this image,
+     * and a console that answered nothing for the first twenty seconds would
+     * look like a board that had not booted. The task takes the radio lock
+     * like any other caller, so a command that needs the radio waits for the
+     * rejoin rather than racing it.
+     */
+    ndw_provision_start();
 
     /*
      * Rejoin a known network before BLE comes up, so a box that has been

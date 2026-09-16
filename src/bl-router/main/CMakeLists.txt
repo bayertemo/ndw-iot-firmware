@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "ndw_status.c" "ndw_button.c" "ndw_scan.c" "ndw_command.c" "ndw_queue.c" "ndw_uplink.c" "ndw_telemetry.c"
+    SRCS "main.c" "ndw_status.c" "ndw_button.c" "ndw_scan.c" "ndw_command.c" "ndw_queue.c" "ndw_uplink.c" "ndw_telemetry.c" "ndw_provision.c"
     INCLUDE_DIRS "."
     # json for the provisioning payload, nvs_flash for proven credentials,
     # bt for NimBLE, esp_wifi for the join.

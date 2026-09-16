@@ -47,7 +47,7 @@ static const char *TAG = "ndw-uplink";
 #endif
 
 /* Long enough for mqtts://host.example.com:8883 and room to spare. */
-#define BROKER_MAX 128
+#define BROKER_MAX NDW_BROKER_MAX
 
 #define NVS_NAMESPACE "ndw"
 #define NVS_KEY_BROKER "broker"
@@ -310,6 +310,18 @@ static void apply_broker(void)
     if (s_client == NULL) {
         return;
     }
+
+    /*
+     * Down until the new address proves otherwise.
+     *
+     * esp_mqtt_client_stop() raises no DISCONNECTED event, so nothing else
+     * clears this — and a caller asking "did that work?" a moment later would
+     * be told yes by the connection that was just torn down. That is exactly
+     * what provisioning asks, and it reported an unreachable broker as
+     * connected in under a second.
+     */
+    s_connected = false;
+    s_error = "";
 
     esp_mqtt_client_stop(s_client);
     /* Same bundle as init: a broker typed into the console is exactly the
