@@ -54,6 +54,8 @@
 #include "ndw_scan.h"
 #include "ndw_telemetry.h"
 #include "ndw_uplink.h"
+#include "ndw_provision.h"
+#include "ndw_router.h"
 #include "ndw_status.h"
 
 static const char *TAG = "ndw-router";
@@ -68,14 +70,11 @@ static const char *TAG = "ndw-router";
 #define NDW_VERSION "0.0.0-dev"
 #endif
 
+
 /* Where proven credentials live. */
 #define NVS_NAMESPACE "ndw"
 #define NVS_KEY_SSID  "ssid"
 #define NVS_KEY_PASS  "pass"
-
-/* WPA2 limits: 32 bytes of SSID, 63 of passphrase, plus terminators. */
-#define SSID_MAX 33
-#define PASS_MAX 64
 
 /* How long to wait for a join before calling it failed. */
 #define JOIN_TIMEOUT_MS 20000
@@ -92,6 +91,24 @@ static const char *TAG = "ndw-router";
 static EventGroupHandle_t s_wifi_events;
 #define WIFI_JOINED BIT0
 #define WIFI_FAILED BIT1
+
+/*
+ * Serialises everything that drives the radio.
+ *
+ * The join path keeps its state in file statics — the attempt count, the last
+ * failure, the reconfiguring guard — and none of it is per-caller. That was
+ * safe while one task at a time could ask: BLE provisioning ran on the host
+ * task, and the boot path had finished before the host task existed.
+ *
+ * The console broke that. app_main sits inside a join for up to twenty seconds
+ * while rejoining a stored network, and the console task is answering commands
+ * throughout. Two joins interleaved would share one attempt counter and one
+ * failure cause, and report each other's outcome.
+ *
+ * A scan takes it too: the driver will not scan during a join, and a caller
+ * that waits is better than one that gets an error it cannot act on.
+ */
+static SemaphoreHandle_t s_radio_lock;
 
 static char s_eui[NDW_EUI_LEN + 1];
 
@@ -115,6 +132,7 @@ static const char *s_last_failure = NDW_STATUS_FAILED;
 
 static void ndw_advertise(void);
 static void ndw_pairing_close(void);
+static bool ndw_wifi_join_locked(const char *ssid, const char *password);
 
 /*
  * How long a pairing window stays open.
@@ -187,7 +205,7 @@ static void ndw_derive_eui(void)
  * rejected or silently mangled by the router, so it is folded here rather
  * than trusted.
  */
-static void ndw_set_hostname(const char *label)
+void ndw_set_hostname(const char *label)
 {
     size_t out = 0;
     out += (size_t)snprintf(s_hostname, sizeof(s_hostname), "NDW-");
@@ -330,6 +348,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 static void ndw_wifi_init(void)
 {
     s_wifi_events = xEventGroupCreate();
+    s_radio_lock = xSemaphoreCreateMutex();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -360,7 +379,75 @@ static void ndw_wifi_init(void)
  * once an IP has actually arrived — association alone is not a working
  * network.
  */
-static bool ndw_wifi_join(const char *ssid, const char *password)
+/*
+ * Taken by anything that drives the radio, and held across the whole
+ * operation rather than around each driver call: the state being protected is
+ * the retry bookkeeping between them, not the calls themselves.
+ */
+void ndw_radio_lock(void)
+{
+    if (s_radio_lock != NULL) {
+        xSemaphoreTake(s_radio_lock, portMAX_DELAY);
+    }
+}
+
+void ndw_radio_unlock(void)
+{
+    if (s_radio_lock != NULL) {
+        xSemaphoreGive(s_radio_lock);
+    }
+}
+
+/*
+ * Where provisioning stands, in one word.
+ *
+ * Three states rather than two: a box that has never been told anything is
+ * different from one that was told and could not get on, and a console that
+ * cannot tell them apart would offer to retry credentials that do not exist.
+ */
+const char *ndw_provision_state(void)
+{
+    if (s_joined) {
+        return NDW_STATUS_CONNECTED;
+    }
+    return s_ssid[0] != '\0' ? s_last_failure : "unprovisioned";
+}
+
+const char *ndw_eui(void)
+{
+    return s_eui;
+}
+
+void ndw_forget_credentials(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "could not open nvs to forget credentials");
+        return;
+    }
+
+    /* Erasing the keys rather than the namespace: the press counter and the
+       provisioned broker live here too, and forgetting a network is not the
+       same as forgetting everything. */
+    nvs_erase_key(nvs, NVS_KEY_SSID);
+    nvs_erase_key(nvs, NVS_KEY_PASS);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    s_ssid[0] = '\0';
+    ESP_LOGI(TAG, "credentials forgotten");
+}
+
+bool ndw_wifi_join(const char *ssid, const char *password)
+{
+    ndw_radio_lock();
+    bool joined = ndw_wifi_join_locked(ssid, password);
+    ndw_radio_unlock();
+    return joined;
+}
+
+/* The join itself, with the lock already held. */
+static bool ndw_wifi_join_locked(const char *ssid, const char *password)
 {
     wifi_config_t cfg = {0};
     strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
@@ -418,7 +505,7 @@ static bool ndw_wifi_join(const char *ssid, const char *password)
 
 /* --------------------------------------------------------------- storage */
 
-static bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
@@ -432,7 +519,7 @@ static bool ndw_load_credentials(char *ssid, size_t ssid_len, char *pass, size_t
     return ok;
 }
 
-static void ndw_store_credentials(const char *ssid, const char *pass)
+void ndw_store_credentials(const char *ssid, const char *pass)
 {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
@@ -457,7 +544,7 @@ static void ndw_store_credentials(const char *ssid, const char *pass)
  * the allocation-free version is both shorter and cannot fail part-way
  * through a notify.
  */
-static int ndw_status_json(char *out, size_t len, const char *state)
+int ndw_status_json(char *out, size_t len, const char *state)
 {
     char ip[16] = "";
     int8_t rssi = 0;
@@ -491,11 +578,20 @@ static int ndw_status_json(char *out, size_t len, const char *state)
      * is up but not keeping up.
      */
     return snprintf(out, len,
-                    "{\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\","
+                    "{\"state\":\"%s\",\"eui\":\"%s\",\"firmware\":\"%s\","
+                    "\"ssid\":\"%s\",\"ip\":\"%s\","
                     "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rssi\":%d,"
                     "\"uplink\":{\"broker\":\"%s\",\"connected\":%s,"
                     "\"error\":\"%s\",\"queued\":%u,\"sent\":%lu}}",
-                    state, s_ssid, ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
+                    /*
+                     * The EUI and the version, because the console needs both
+                     * and neither was here. It claims the box by the EUI, and
+                     * the version is the one question a flasher cannot answer
+                     * for itself: whether the image that booted is the image
+                     * that was just written.
+                     */
+                    state, s_eui, NDW_FIRMWARE_VERSION, s_ssid, ip,
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi,
                     ndw_uplink_broker(), ndw_uplink_connected() ? "true" : "false",
                     ndw_uplink_last_error(), (unsigned)ndw_queue_depth(),
                     (unsigned long)ndw_scan_count());
@@ -913,6 +1009,17 @@ void app_main(void)
     // gateway it is listening for.
     ndw_command_init(s_eui);
     ndw_uplink_init(s_eui);
+
+    /*
+     * Before the rejoin below, which blocks for up to twenty seconds.
+     *
+     * The browser opens the port as soon as the board reboots into this image,
+     * and a console that answered nothing for the first twenty seconds would
+     * look like a board that had not booted. The task takes the radio lock
+     * like any other caller, so a command that needs the radio waits for the
+     * rejoin rather than racing it.
+     */
+    ndw_provision_start();
 
     /*
      * Rejoin a known network before BLE comes up, so a box that has been

@@ -41,3 +41,14 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Provisioning happens over the same cable that flashed the board, so stdin
+# has to arrive on the USB peripheral rather than on UART0's pins.
+#
+# The default is UART0-primary with USB-Serial-JTAG as a secondary *log sink* —
+# output reaches the browser either way, which is why this looked like it
+# already worked. Input does not: nothing routes stdin to USB in that mode, and
+# a console that can be read but not spoken to is no console at all.
+#
+# Most C3 boards people will buy expose only the native USB port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
