@@ -127,6 +127,18 @@ static int s_join_attempts;
  * leaving. A box given new credentials would keep trying the previous ones.
  */
 static volatile bool s_reconfiguring;
+
+/*
+ * Retries a stored network after the attempts for one request run out.
+ *
+ * One-shot and restarted on each failure rather than periodic, so a box that
+ * comes back on the first retry is not still holding a timer. The interval is
+ * long enough not to hammer an access point that is genuinely gone, short
+ * enough that a router finishing a reboot is picked up while someone is still
+ * standing there wondering.
+ */
+#define RETRY_INTERVAL_MS (30 * 1000)
+static TimerHandle_t s_retry_timer;
 /* Set from the disconnect reason, so the reported failure names a cause. */
 static const char *s_last_failure = NDW_STATUS_FAILED;
 
@@ -323,9 +335,25 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             return;
         }
 
-        ESP_LOGE(TAG, "join failed (reason %d), giving up", ev->reason);
+        /*
+         * Out of attempts for this request, so whoever asked gets an answer.
+         *
+         * But the radio does not stop trying. An access point that was down,
+         * a router mid-reboot, a band that was briefly too busy — none of
+         * those are permanent, and a box that gave up on them forever would
+         * need a person with a cable to fix something that fixed itself.
+         *
+         * That mattered less when BLE was always listening and a box could be
+         * re-provisioned where it stood. It is the whole difference now:
+         * unattended recovery is the only recovery an installed box has.
+         */
+        ESP_LOGE(TAG, "join failed (reason %d), backing off", ev->reason);
         s_joined = false;
         xEventGroupSetBits(s_wifi_events, WIFI_FAILED);
+
+        if (s_retry_timer != NULL) {
+            xTimerStart(s_retry_timer, 0);
+        }
         return;
     }
 
@@ -333,6 +361,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         const ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "joined, ip " IPSTR, IP2STR(&ev->ip_info.ip));
         s_joined = true;
+        /* Whatever we were backing off from, we are past it. */
+        if (s_retry_timer != NULL) {
+            xTimerStop(s_retry_timer, 0);
+        }
         /* An event, not a wait for the next heartbeat: a join five minutes
            ago and a join just now mean different things. */
         ndw_telemetry_notify(NDW_TELEMETRY_NETWORK);
@@ -345,10 +377,70 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
+/*
+ * Tries a stored network again, after the radio gave up on it.
+ *
+ * Runs on the timer task, which must not block — so this asks the driver to
+ * reconnect and lets the event handler take it from there, rather than
+ * calling the join and waiting twenty seconds inside a timer callback.
+ *
+ * Nothing to do if a console is mid-join: the attempt counter is reset by
+ * whoever is driving, and a reconnect underneath it would spend one of their
+ * retries on the old network.
+ */
+static void on_retry_timer(TimerHandle_t timer)
+{
+    (void)timer;
+
+    if (s_joined || s_reconfiguring) {
+        return;
+    }
+
+    char ssid[SSID_MAX] = {0};
+    char pass[PASS_MAX] = {0};
+    if (!ndw_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        /* Never provisioned, or the credentials were forgotten. Nothing to
+           retry, and no timer to restart — the next provisioning starts it. */
+        return;
+    }
+
+    /*
+     * Put the stored credentials back before reconnecting.
+     *
+     * esp_wifi_connect() uses whatever config the driver is holding, and after
+     * a failed provisioning attempt that is the config that just failed —
+     * so retrying without this re-tries the wrong password forever, which
+     * looks exactly like a network that has genuinely gone away. Found on
+     * hardware: reason 15 (4-way handshake timeout) on every retry, against
+     * an access point that was working.
+     */
+    wifi_config_t cfg = {0};
+    strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+    strlcpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password));
+
+    ESP_LOGI(TAG, "retrying '%s'", ssid);
+    s_join_attempts = 0;
+
+    /* The disconnect this raises is ours, so the handler must not spend a
+       retry reconnecting to what we are replacing. */
+    s_reconfiguring = true;
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    s_reconfiguring = false;
+
+    esp_wifi_connect();
+
+    /* Restarted by the disconnect handler if this fails, rather than made
+       periodic: a box that comes back on the first retry is not left holding
+       a timer. */
+}
+
 static void ndw_wifi_init(void)
 {
     s_wifi_events = xEventGroupCreate();
     s_radio_lock = xSemaphoreCreateMutex();
+    s_retry_timer = xTimerCreate("ndw-retry", pdMS_TO_TICKS(RETRY_INTERVAL_MS), pdFALSE, NULL,
+                                 on_retry_timer);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
