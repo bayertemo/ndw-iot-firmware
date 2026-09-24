@@ -308,6 +308,11 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          # For every step, not only the build. platformio.ini interpolates
+          # it into the build flags, and PlatformIO wipes the build directory
+          # whenever its configuration changes — so a later `pio project
+          # metadata` run without it deleted the images it was asked about.
+          echo "NDW_VERSION=${version}" >> "$GITHUB_ENV"
           echo "Building ${{ matrix.build }} as ${version}"
 
       - uses: actions/setup-python@v5
@@ -322,9 +327,7 @@ jobs:
 
       - name: Build
         working-directory: src/${{ matrix.project }}
-        env:
-          # platformio.ini turns this into the firmware's version string.
-          NDW_VERSION: ${{ steps.version.outputs.version }}
+        # NDW_VERSION comes from the job environment, set above.
         run: |
           set -euo pipefail
           # Pinned in requirements.txt, like the IDF image: a toolchain that
