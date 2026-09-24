@@ -38,16 +38,16 @@
 //
 // ## One radio, many devices
 //
-// Each device is a file in LittleFS holding its keys, its RadioLib nonces and
-// session, and its register. Its turn loads that file into the one RadioLib
+// Each device is an NVS entry holding its keys, its RadioLib nonces and
+// session, and its register. Its turn loads that entry into the one RadioLib
 // node — beginOTAA with its keys, then its nonces and session, which RadioLib
 // restores without a join — and saves it straight back. So frame counters and
 // DevNonces never go backwards across a reboot: ChirpStack refuses a reused
 // DevNonce, and drops frames whose counter did.
 //
-// Programming the same DevEUIs again keeps their files, so a fleet can be
+// Programming the same DevEUIs again keeps their entries, so a fleet can be
 // reprogrammed (a new interval, a changed mix) without every device being
-// refused on rejoin. A device left out of a new fleet has its file deleted;
+// refused on rejoin. A device left out of a new fleet has its entry deleted;
 // adding it back later starts its DevNonces over, and ChirpStack then needs
 // that device's nonces flushed.
 //
@@ -63,6 +63,7 @@
 #include <RadioLib.h>
 #include <SSD1306Wire.h>
 #include <esp_mac.h>
+#include <nvs.h>
 #include <vector>
 
 #ifndef PROBE_VERSION
@@ -98,9 +99,6 @@ static const uint32_t JOIN_BACKOFF_MAX_S = 3600;
 static const uint8_t CHECK_EVERY = 8;
 static const uint8_t CHECKS_MISSED = 3;
 
-static const char* DIR = "/d";
-static const char* CFG_FILE = "/fleet.cfg";
-static const char* LIST_FILE = "/fleet.lst";
 static const uint32_t MAGIC = 0x4e445746;  // "NDWF"
 static const uint16_t VERSION = 1;
 
@@ -519,48 +517,48 @@ void startScreen() {
 }
 
 // ---- storage -------------------------------------------------------------
+//
+// NVS, in a partition of its own ("fleet", in partitions.csv): a key per
+// device, looked up through an index NVS keeps in RAM, written in a few
+// milliseconds and spread across the partition's pages. LittleFS was tried
+// first and took 0.6 s to open one file among 200, which made a boot with a
+// full fleet take two minutes — long enough for a host to decide nothing
+// was answering.
 
-String recordPath(uint64_t devEui) {
-  return String(DIR) + "/" + hex64(devEui);
+Preferences store;
+
+// NVS keys are at most 15 characters, and a DevEUI in hex is 16: this is the
+// same 8 bytes as "d" and 11 characters of base64url.
+String recordKey(uint64_t devEui) {
+  static const char* ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  char key[13] = {'d'};
+  for (int i = 0; i < 10; i++) key[1 + i] = ALPHABET[(devEui >> (58 - 6 * i)) & 0x3f];
+  // Ten characters carry 60 bits; the last holds the low 4, shifted up.
+  key[11] = ALPHABET[(devEui & 0x0f) << 2];
+  key[12] = 0;
+  return String(key);
 }
 
 bool readRecord(uint64_t devEui, Record& out) {
-  // Checked first: opening a missing file logs an error, and a device new to
-  // the fleet has none yet.
-  String path = recordPath(devEui);
-  if (!LittleFS.exists(path)) return false;
-  File f = LittleFS.open(path, "r");
-  if (!f) return false;
-  bool ok = f.read((uint8_t*)&out, sizeof(Record)) == sizeof(Record);
-  f.close();
+  String key = recordKey(devEui);
+  if (!store.isKey(key.c_str())) return false;
+  bool ok = store.getBytes(key.c_str(), &out, sizeof(Record)) == sizeof(Record);
   return ok && out.magic == MAGIC && out.version == VERSION && out.devEui == devEui;
 }
 
 bool writeRecord(const Record& r) {
-  File f = LittleFS.open(recordPath(r.devEui), "w");
-  if (!f) return false;
-  bool ok = f.write((const uint8_t*)&r, sizeof(Record)) == sizeof(Record);
-  f.close();
-  return ok;
+  return store.putBytes(recordKey(r.devEui).c_str(), &r, sizeof(Record)) == sizeof(Record);
 }
 
 bool writeConfig(const Config& c) {
   Config out = c;
   out.epoch = epochNow();
-  File f = LittleFS.open(CFG_FILE, "w");
-  if (!f) return false;
-  bool ok = f.write((const uint8_t*)&out, sizeof(out)) == sizeof(out);
-  f.close();
   view.lastCfgSave = millis();
-  return ok;
+  return store.putBytes("cfg", &out, sizeof(out)) == sizeof(out);
 }
 
 bool writeList(const uint64_t* euis, uint16_t count) {
-  File f = LittleFS.open(LIST_FILE, "w");
-  if (!f) return false;
-  bool ok = f.write((const uint8_t*)euis, count * sizeof(uint64_t)) == count * sizeof(uint64_t);
-  f.close();
-  return ok;
+  return store.putBytes("list", euis, count * sizeof(uint64_t)) == count * sizeof(uint64_t);
 }
 
 // Spreads the fleet's reports across the interval rather than bunching them:
@@ -574,18 +572,13 @@ void schedule() {
 }
 
 bool loadFleet() {
-  File f = LittleFS.open(CFG_FILE, "r");
-  if (!f) return false;
   Config c;
-  bool ok = f.read((uint8_t*)&c, sizeof(c)) == sizeof(c);
-  f.close();
-  if (!ok || c.magic != MAGIC || c.version != VERSION || c.count == 0 || c.count > MAX_FLEET) return false;
-
+  if (store.getBytes("cfg", &c, sizeof(c)) != sizeof(c) || c.magic != MAGIC || c.version != VERSION ||
+      c.count == 0 || c.count > MAX_FLEET) {
+    return false;
+  }
   uint64_t* euis = (uint64_t*)calloc(c.count, sizeof(uint64_t));
-  f = LittleFS.open(LIST_FILE, "r");
-  ok = f && f.read((uint8_t*)euis, c.count * sizeof(uint64_t)) == c.count * sizeof(uint64_t);
-  if (f) f.close();
-  if (!ok) {
+  if (store.getBytes("list", euis, c.count * sizeof(uint64_t)) != c.count * sizeof(uint64_t)) {
     free(euis);
     return false;
   }
@@ -612,56 +605,93 @@ bool loadFleet() {
   return n > 0;
 }
 
-// The single-device probe this replaces kept its keys in Preferences. A board
-// still carrying them becomes a fleet of one with the same keys, nonces and
-// register — so it rejoins on the next DevNonce, rather than one ChirpStack
-// has already seen, and its total carries on rather than restarting.
+// Deletes the records of devices no longer in the fleet — including any a
+// programming left behind when it was abandoned before its commit.
+void prune(const uint64_t* keep, uint16_t count) {
+  std::vector<String> drop;
+  nvs_iterator_t it = nvs_entry_find("fleet", "fleet", NVS_TYPE_BLOB);
+  while (it) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    if (info.key[0] == 'd') {
+      bool kept = false;
+      for (uint16_t i = 0; i < count && !kept; i++) kept = recordKey(keep[i]) == info.key;
+      if (!kept) drop.push_back(String(info.key));
+    }
+    it = nvs_entry_next(it);
+  }
+  for (const String& key : drop) store.remove(key.c_str());
+}
+
+// Firmware 0.2.0 kept the fleet in LittleFS. A board still carrying one has
+// it copied here once — slowly, at LittleFS's pace, which is the reason for
+// the move — so its devices keep their DevNonces and sessions, and the old
+// files are then wiped.
+void importLittleFs() {
+  if (!LittleFS.begin(false)) return;
+  File f = LittleFS.open("/fleet.cfg", "r");
+  Config c;
+  bool ok = f && f.read((uint8_t*)&c, sizeof(c)) == sizeof(c) && c.magic == MAGIC && c.version == VERSION &&
+            c.count > 0 && c.count <= MAX_FLEET;
+  if (f) f.close();
+  if (ok) {
+    show("upgrading storage");
+    Serial.printf("[probe] moving %u devices out of LittleFS, once\n", c.count);
+    uint64_t* euis = (uint64_t*)calloc(c.count, sizeof(uint64_t));
+    f = LittleFS.open("/fleet.lst", "r");
+    ok = f && f.read((uint8_t*)euis, c.count * sizeof(uint64_t)) == c.count * sizeof(uint64_t);
+    if (f) f.close();
+    for (uint16_t i = 0; ok && i < c.count; i++) {
+      f = LittleFS.open("/d/" + hex64(euis[i]), "r");
+      if (f && f.read((uint8_t*)&rec, sizeof(Record)) == sizeof(Record) && rec.devEui == euis[i]) writeRecord(rec);
+      if (f) f.close();
+      if (i % 20 == 19) show("upgrading " + String(i + 1) + "/" + String(c.count));
+    }
+    if (ok) {
+      epochAt = 0;
+      ok = writeList(euis, c.count) && store.putBytes("cfg", &c, sizeof(c)) == sizeof(c);
+    }
+    free(euis);
+  }
+  LittleFS.end();
+  if (ok) {
+    LittleFS.format();
+    Serial.println("[probe] storage upgraded");
+  }
+}
+
+// The single-device probe before that kept its keys in Preferences, in the
+// default NVS partition. A board still carrying them becomes a fleet of one
+// with the same keys, nonces and register — so it rejoins on the next
+// DevNonce, rather than one ChirpStack has already seen, and its total
+// carries on rather than restarting.
 void migrate() {
-  Preferences store;
-  if (!store.begin("lorawan", false)) return;
-  if (!store.getBool("prov", false)) {
-    store.end();
+  Preferences old;
+  if (!old.begin("lorawan", false)) return;
+  if (!old.getBool("prov", false)) {
+    old.end();
     return;
   }
   memset(&rec, 0, sizeof(rec));
   rec.magic = MAGIC;
   rec.version = VERSION;
-  rec.devEui = store.getULong64("deveui", 0);
+  rec.devEui = old.getULong64("deveui", 0);
   if (!rec.devEui) rec.devEui = boardEui();
-  rec.joinEui = store.getULong64("joineui", 0);
-  store.getBytes("appkey", rec.appKey, 16);
+  rec.joinEui = old.getULong64("joineui", 0);
+  old.getBytes("appkey", rec.appKey, 16);
   rec.kind = WATER;
   rec.scale = 1.0f;
-  rec.reg = store.getUInt("dl", 0);
+  rec.reg = old.getUInt("dl", 0);
   rec.battery = 100;
-  rec.haveNonces = store.getBytes("nonces", rec.nonces, sizeof(rec.nonces)) == sizeof(rec.nonces);
+  rec.haveNonces = old.getBytes("nonces", rec.nonces, sizeof(rec.nonces)) == sizeof(rec.nonces);
 
-  Config c = {MAGIC, VERSION, 1, store.getUShort("interval", 60), 0, 0, 0};
+  Config c = {MAGIC, VERSION, 1, old.getUShort("interval", 60), 0, 0, 0};
   if (c.intervalS < INTERVAL_MIN_S) c.intervalS = INTERVAL_MIN_S;
   if (writeRecord(rec) && writeList(&rec.devEui, 1) && writeConfig(c)) {
-    store.clear();
+    old.clear();
     Serial.printf("[probe] kept %s from the single-device firmware\n", hex64(rec.devEui).c_str());
   }
-  store.end();
-}
-
-// Deletes the files of devices no longer in the fleet.
-void prune(const uint64_t* keep, uint16_t count) {
-  File dir = LittleFS.open(DIR);
-  if (!dir) return;
-  std::vector<String> drop;
-  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    uint64_t eui;
-    String name = f.name();
-    f.close();
-    bool kept = false;
-    if (parseEui(name.c_str(), &eui)) {
-      for (uint16_t i = 0; i < count && !kept; i++) kept = keep[i] == eui;
-    }
-    if (!kept) drop.push_back(String(DIR) + "/" + name);
-  }
-  dir.close();
-  for (const String& p : drop) LittleFS.remove(p);
+  old.end();
 }
 
 // ---- LoRaWAN, one device at a time --------------------------------------
@@ -1077,9 +1107,7 @@ void onCommand(const String& line) {
     out["clock"] = clockSource;
     reply(out);
   } else if (cmd == "forget") {
-    LittleFS.remove(CFG_FILE);
-    LittleFS.remove(LIST_FILE);
-    prune(nullptr, 0);
+    store.clear();
     JsonDocument out;
     out["ok"] = true;
     out["state"] = "rebooting";
@@ -1126,12 +1154,12 @@ void setup() {
   sampleBattery();
   startScreen();
 
-  if (!LittleFS.begin(true)) {
-    view.error = "no filesystem";
-    Serial.println("[probe] LittleFS failed to mount");
+  if (!store.begin("fleet", false, "fleet")) {
+    view.error = "no fleet storage";
+    Serial.println("[probe] the fleet NVS partition did not open");
   }
-  LittleFS.mkdir(DIR);
-  if (!LittleFS.exists(CFG_FILE)) migrate();
+  if (!store.isKey("cfg")) importLittleFs();
+  if (!store.isKey("cfg")) migrate();
 
   if (!loadFleet()) {
     Serial.printf("[probe] board %s, not programmed\n", hex64(boardEui()).c_str());

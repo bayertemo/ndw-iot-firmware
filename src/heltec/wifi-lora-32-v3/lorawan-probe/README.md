@@ -80,12 +80,17 @@ joined count, the device on air, reports sent and faults showing.
 ## Things that bite
 
 - **ChirpStack rejects a reused DevNonce, and frames whose counter went
-  back.** Each device is a file in LittleFS with its RadioLib nonces and
-  session, saved after every join and report, so neither goes backwards.
-  Programming the same DevEUIs again keeps their files; a device dropped from
-  the fleet loses its file, and if it is added back ChirpStack refuses its
-  joins until its dev-nonces are flushed there. `./tools.sh erase` loses them
-  all.
+  back.** Each device is an NVS entry with its RadioLib nonces and session,
+  saved after every join and report, so neither goes backwards. Programming
+  the same DevEUIs again keeps their entries; a device dropped from the fleet
+  loses its entry, and if it is added back ChirpStack refuses its joins until
+  its dev-nonces are flushed there. `./tools.sh erase` loses them all.
+- **The fleet is in NVS, in its own partition** (`fleet`, in
+  `partitions.csv`, cut from the unused second app slot). 0.2.0 kept it in
+  LittleFS, which took 0.6 s to open each of 200 files: a full fleet took two
+  minutes to boot, and a host asking `hello` gave up first. A board upgraded
+  from 0.2.0 copies its fleet across on the first boot — about 80 s for 200 —
+  and wipes the old files.
 - **The single-device firmware's keys carry over.** A board upgraded from
   0.1.x keeps its device as a fleet of one, with its nonces and total.
 - **The null NwkKey is deliberate.** `beginOTAA(joinEUI, devEUI, nullptr,

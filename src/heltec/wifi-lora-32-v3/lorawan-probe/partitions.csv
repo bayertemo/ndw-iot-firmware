@@ -1,0 +1,16 @@
+# The Arduino core's default_8MB layout, with the second app slot cut down to
+# make room for "fleet": the NVS partition the meter fleet lives in. Nothing
+# here updates over the air, so app1 is never written; it keeps a slot the
+# size of the whole app, more than the image needs.
+#
+# spiffs stays where it was: firmware 0.2.0 kept the fleet there in LittleFS,
+# and a board upgraded from it copies its fleet out on first boot.
+#
+# Name,   Type, SubType,  Offset,   Size,    Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x330000,
+app1,     app,  ota_1,    0x340000, 0x2B0000,
+fleet,    data, nvs,      0x5F0000, 0x80000,
+spiffs,   data, spiffs,   0x670000, 0x180000,
+coredump, data, coredump, 0x7F0000, 0x10000,
