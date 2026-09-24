@@ -25,7 +25,7 @@ The host writes one JSON command per line; every answer is a line starting
 | Command | Does |
 | --- | --- |
 | `{"cmd":"hello"}` | `eui`, `firmware`, `kind` (`lorawan-probe`), `state`, `fleet`, `maxFleet` |
-| `{"cmd":"status"}` | the fleet: size, water/power, joined, reports sent, faults by kind, clock source, signal |
+| `{"cmd":"status"}` | the fleet: size, water/power/gas, joined, reports sent, devices in an anomaly (`faults.high`), clock source, signal |
 | `{"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,"epoch":…,"tzOffset":…}` | starts receiving a fleet; the running one stops |
 | `{"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"\|"power"\|"gas","<joinEui>"],…]}` | a chunk of devices, each chunk answered |
 | `{"cmd":"fleet-commit"}` | saves the fleet and reboots to join it |
@@ -55,11 +55,11 @@ AppKeys are never sent back.
   then a kettle or an oven. Gas follows the heating — a morning and an evening
   run, a night setback — and the season, several times more in January than
   in July. Each device has its own size of household.
-- About `anomalies`% of each device's reports show a fault, in episodes:
-  water leaks (a flow that never stops), bursts, a stuck register, a silent
-  meter; electricity demand spikes, stuck or silent meters; gas leaks, stuck or
-  silent meters. A silent meter
-  keeps counting, so the gap shows in its register when it returns.
+- About `anomalies`% of each device's reports are an **anomaly**: a stretch
+  of 4 to 24 reports — an hour to six at 15 minutes — consuming 4 to 10 times
+  the device's normal, water drawn in every interval, gas burnt, electricity
+  demanded. The one kind of fault there is, and the pattern MeterFax's alerts
+  look for, so devices trip them at random.
 - The clock comes from the browser, then from the network's DeviceTimeAns,
   and is saved so a reboot away from both keeps roughly the day.
 - Every eighth report asks for a LinkCheck; three unanswered in a row and the

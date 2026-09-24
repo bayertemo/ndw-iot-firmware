@@ -22,11 +22,12 @@
 //
 //   {"cmd":"hello"}        → eui, firmware, kind, state — kind is
 //                            "lorawan-probe", the word hosts look for
-//   {"cmd":"status"}       → the fleet: size, joined, sent, faults, signal
+//   {"cmd":"status"}       → the fleet: size, joined, sent, anomalies, signal
 //   {"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,
 //    "epoch":1790000000,"tzOffset":-300}
 //   {"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"|"power"|"gas",
-//    "<joinEui>"?],…]}     → a chunk at a time, each answered
+//    "<joinEui>"?],…]}     → a chunk at a time, each answered; the kind is
+//                            required, the host deciding the fleet's mix
 //   {"cmd":"fleet-commit"} → saves the fleet, reboots, starts joining
 //   {"cmd":"lorawan","appKey":"…","devEui":"…"?,"joinEui":"…"?}
 //                          → a fleet of one water meter: the board itself
@@ -106,37 +107,22 @@ static const uint16_t VERSION = 1;
 
 enum Kind : uint8_t { WATER = 0, POWER = 1, GAS = 2 };
 
-// A fault a meter is showing, for a stretch of its reports.
+// What a meter is doing, for a stretch of its reports. One kind of fault:
+// consumption far above the household's normal — the pattern MeterFax's
+// alerts look for — for a few hours at a time, about cfg.anomalyPct of each
+// device's reports in the long run.
 enum Anomaly : uint8_t {
   NORMAL = 0,
-  LEAK,    // water: a slow flow that never stops, through the night too
-  BURST,   // water: a pipe gone — tens of litres a minute, briefly
-  STUCK,   // the register stops moving though the household carries on
-  SILENT,  // the meter stops reporting, and resumes with the gap in it
-  SPIKE,   // power: demand far beyond the household's normal
+  EXCESS,  // several times the usual draw, burn or demand (not HIGH: Arduino's pin level)
   ANOMALY_KINDS,
 };
-static const char* ANOMALY_NAMES[ANOMALY_KINDS] = {"normal", "leak", "burst", "stuck", "silent", "spike"};
+static const char* ANOMALY_NAMES[ANOMALY_KINDS] = {"normal", "high"};
 
-struct Fault {
-  Anomaly anomaly;
-  float share;
-  uint8_t minLen, maxLen;  // in reports
-};
+// An episode lasts this many reports: an hour to six, at a 15-minute interval.
+static const uint8_t EPISODE_MIN = 4, EPISODE_MAX = 24;
 
-// Water primarily: leaks are the fault a water bill is most often wrong
-// about, so they are the commonest and the longest.
-static const Fault WATER_FAULTS[] = {
-  {LEAK, 0.45f, 8, 48}, {BURST, 0.15f, 1, 4}, {STUCK, 0.25f, 8, 40}, {SILENT, 0.15f, 2, 12},
-};
-static const Fault POWER_FAULTS[] = {
-  {SPIKE, 0.50f, 1, 4}, {STUCK, 0.30f, 8, 40}, {SILENT, 0.20f, 2, 12},
-};
-// Gas has no burst worth simulating — a rupture is a gas main, not a meter
-// reading — so a leak, a register that stops, or a meter that goes quiet.
-static const Fault GAS_FAULTS[] = {
-  {LEAK, 0.50f, 8, 48}, {STUCK, 0.30f, 8, 40}, {SILENT, 0.20f, 2, 12},
-};
+// How far above normal an episode runs.
+static const float EXCESS_MIN = 4.0f, EXCESS_MAX = 10.0f;
 
 // One device as it is kept in flash.
 struct __attribute__((packed)) Record {
@@ -359,11 +345,14 @@ float waterDaySum() {
   return s;
 }
 
-// Starts, continues or ends a fault episode. Episodes start with the
-// probability that makes a device anomalous for about cfg.anomalyPct of its
-// reports in the long run: a share r with episodes of mean length L starts
+// Starts, continues or ends a high-consumption episode. Episodes start with
+// the probability that makes a device anomalous for about cfg.anomalyPct of
+// its reports in the long run: a share r with episodes of mean length L starts
 // one at p = r / (L·(1 − r)) per normal report.
 void stepAnomaly(Record& d) {
+  // A device recorded mid-fault by 0.3.0, whose faults were other kinds,
+  // resumes normal: its old kind means nothing here.
+  if (d.anomaly >= ANOMALY_KINDS) d.anomaly = NORMAL;
   if (d.anomaly != NORMAL) {
     if (d.anomalyLeft > 0) d.anomalyLeft--;
     if (d.anomalyLeft == 0) d.anomaly = NORMAL;
@@ -371,21 +360,15 @@ void stepAnomaly(Record& d) {
   }
   float r = min(cfg.anomalyPct, (uint8_t)90) / 100.0f;
   if (r <= 0) return;
-
-  const Fault* faults = d.kind == WATER ? WATER_FAULTS : d.kind == GAS ? GAS_FAULTS : POWER_FAULTS;
-  size_t n = (d.kind == WATER   ? sizeof(WATER_FAULTS)
-              : d.kind == GAS   ? sizeof(GAS_FAULTS)
-                                : sizeof(POWER_FAULTS)) /
-             sizeof(Fault);
-  float meanLen = 0;
-  for (size_t i = 0; i < n; i++) meanLen += faults[i].share * (faults[i].minLen + faults[i].maxLen) / 2.0f;
+  float meanLen = (EPISODE_MIN + EPISODE_MAX) / 2.0f;
   if (rnd(0, 1) >= r / (meanLen * (1 - r))) return;
+  d.anomaly = EXCESS;
+  d.anomalyLeft = EPISODE_MIN + esp_random() % (EPISODE_MAX - EPISODE_MIN + 1);
+}
 
-  float pick = rnd(0, 1);
-  size_t i = 0;
-  while (i < n - 1 && pick >= faults[i].share) pick -= faults[i++].share;
-  d.anomaly = faults[i].anomaly;
-  d.anomalyLeft = faults[i].minLen + esp_random() % (faults[i].maxLen - faults[i].minLen + 1);
+/** The factor an episode puts on consumption, drawn afresh each report. */
+float episode(const Record& d) {
+  return d.anomaly == EXCESS ? rnd(EXCESS_MIN, EXCESS_MAX) : 1.0f;
 }
 
 // Advances the register over the hours since the last reading.
@@ -405,10 +388,11 @@ void consume(Record& d, float hours) {
     float expected = WATER_LITRES_PER_DAY * d.scale * (weekend ? 1.15f : 1.0f) * share * hours;
     float draws = share * 24 * 1.5f * hours;
     float p = 1 - expf(-draws);
-    float litres = rnd(0, 1) < p ? expected / p * rnd(0.5f, 1.5f) : 0;
-    if (d.anomaly == LEAK) litres += rnd(0.05f, 0.8f) * 60 * hours;
-    if (d.anomaly == BURST) litres += rnd(10.0f, 40.0f) * 60 * hours;
-    if (d.anomaly == STUCK) litres = 0;
+    // An episode draws in every interval, not only the busy ones: a hose
+    // left running, a toilet that does not stop.
+    float litres = d.anomaly == EXCESS ? expected * episode(d)
+                   : rnd(0, 1) < p   ? expected / p * rnd(0.5f, 1.5f)
+                                     : 0;
     d.reg += (uint32_t)(litres * 10.0f + 0.5f);
     // A meter's cell loses a percent every week or so.
     if (rnd(0, 1) < hours / 168.0f && d.battery > 5) d.battery--;
@@ -419,10 +403,8 @@ void consume(Record& d, float hours) {
     // near its peak, mid-July near the floor, northern hemisphere.
     float season = 1.0f + 0.8f * cosf(2.0f * PI * (dayOfYear() - 15) / 365.25f);
     float share = GAS_HOURS[h] / gasDaySum();
-    float litres = GAS_LITRES_PER_DAY * d.scale * season * (weekend ? 1.1f : 1.0f) * share * hours * rnd(0.3f, 1.7f);
-    // A leak burns nothing and is metered all the same, night and day.
-    if (d.anomaly == LEAK) litres += rnd(0.02f, 0.3f) * 60 * hours;
-    if (d.anomaly == STUCK) litres = 0;
+    float litres = GAS_LITRES_PER_DAY * d.scale * season * (weekend ? 1.1f : 1.0f) * share * hours *
+                   rnd(0.3f, 1.7f) * episode(d);
     d.reg += (uint32_t)(litres * 10.0f + 0.5f);
     if (rnd(0, 1) < hours / 168.0f && d.battery > 5) d.battery--;
   } else {
@@ -430,12 +412,9 @@ void consume(Record& d, float hours) {
     // own use through the day on top, and now and then a kettle or an oven.
     float watts = 150.0f * d.scale + 1400.0f * d.scale * (weekend ? 1.1f : 1.0f) * POWER_HOURS[h] * rnd(0.6f, 1.4f);
     if (rnd(0, 1) < 0.08f) watts += rnd(1500.0f, 3000.0f);
-    if (d.anomaly == SPIKE) watts = rnd(6000.0f, 11000.0f);
-    // A stuck meter repeats its last reading: register and demand both frozen.
-    if (d.anomaly != STUCK) {
-      d.demandW = (uint16_t)min(watts, 65535.0f);
-      d.reg += (uint32_t)(watts * hours + 0.5f);
-    }
+    watts *= episode(d);
+    d.demandW = (uint16_t)min(watts, 65535.0f);
+    d.reg += (uint32_t)(watts * hours + 0.5f);
   }
 }
 
@@ -645,7 +624,7 @@ bool loadFleet() {
     slots[n].devEui = euis[i];
     slots[n].kind = rec.kind;
     slots[n].joined = rec.joined;
-    slots[n].anomaly = rec.anomaly;
+    slots[n].anomaly = rec.anomaly < ANOMALY_KINDS ? rec.anomaly : NORMAL;
     n++;
   }
   free(euis);
@@ -808,14 +787,6 @@ void report(Slot& s, uint16_t i) {
   stepAnomaly(rec);
   consume(rec, hours);
   s.anomaly = rec.anomaly;
-
-  // A silent meter keeps counting and says nothing: when it comes back, the
-  // gap is in its register, as it would be on a real one.
-  if (rec.anomaly == SILENT) {
-    show("#" + String(i + 1) + " silent");
-    writeRecord(rec);
-    return;
-  }
 
   uint8_t payload[6] = {(uint8_t)(rec.reg >> 24), (uint8_t)(rec.reg >> 16), (uint8_t)(rec.reg >> 8), (uint8_t)rec.reg};
   size_t len;
@@ -1012,7 +983,7 @@ void onCommand(const String& line) {
     out["power"] = countKind(POWER);
     out["gas"] = countKind(GAS);
     JsonObject faults = out["faults"].to<JsonObject>();
-    for (int a = LEAK; a < ANOMALY_KINDS; a++) faults[ANOMALY_NAMES[a]] = countAnomaly((Anomaly)a);
+    for (int a = EXCESS; a < ANOMALY_KINDS; a++) faults[ANOMALY_NAMES[a]] = countAnomaly((Anomaly)a);
     out["sent"] = view.sent;
     out["acked"] = view.acked;
     out["clock"] = clockSource;
@@ -1069,7 +1040,8 @@ void onCommand(const String& line) {
       }
       uint64_t devEui, joinEui = 0;
       uint8_t key[16];
-      String kind = row[2] | "water";
+      // Each device says what it is: the host decides the fleet's mix.
+      String kind = row[2] | "";
       if (!parseEui(row[0] | "", &devEui)) {
         refuse("invalid", which + "the DevEUI must be 16 hex characters.", "devEui");
         return;
