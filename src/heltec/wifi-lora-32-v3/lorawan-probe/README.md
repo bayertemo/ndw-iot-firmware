@@ -1,8 +1,10 @@
-# NDW LoRaWAN probe — Heltec WiFi LoRa 32 V3
+# NDW LoRaWAN meter fleet — Heltec WiFi LoRa 32 V3
 
-A test device that behaves like a water meter, for proving a gateway hears it
-and the readings reach MeterFax — and for carrying to where a meter would sit,
-to see whether the radio reaches from there.
+Up to 200 simulated LoRaWAN meters on one board and one radio: water and
+electricity, each joining on its own keys and reporting on its own schedule,
+with a household's daily rhythm and the faults real meters show. For loading
+a gateway, ChirpStack and MeterFax with traffic that looks like a street's
+worth of meters.
 
 **Hardware:** Heltec WiFi LoRa 32 V3 (also sold as MakerHawk) — ESP32-S3,
 SX1262, SSD1306 OLED. The pins in `src/main.cpp` are that board's. The
@@ -13,47 +15,62 @@ another board it will not work.
 
 The workflow builds it into `builds/ndw/heltec/wifi-lora-32-v3/lora/probe`
 and the manifest, like the other firmware. Nothing about a device is compiled
-in: after flashing, its keys are written over the same USB cable, from a
-browser or from `tools.sh`, and kept in flash across reboots and upgrades.
+in: after flashing, flash.meterfax.com's Program tab makes the fleet —
+random DevEUIs and AppKeys — writes it over the same cable, and downloads the
+CSV that MeterFax's Devices → Import reads, each row on its own profile.
 
 The host writes one JSON command per line; every answer is a line starting
 `#NDW ` followed by JSON — the protocol the NDW router firmware speaks.
 
 | Command | Does |
 | --- | --- |
-| `{"cmd":"hello"}` | `eui`, `firmware`, `state` (`unprovisioned`, `joining`, `joined`) |
-| `{"cmd":"status"}` | everything the screen shows: DevEUI, JoinEUI, band, interval, total, uplinks, signal, battery |
-| `{"cmd":"lorawan","appKey":"…","devEui":"…","joinEui":"…"}` | saves the keys, reboots and joins. `devEui` defaults to the board's MAC widened with FF:FE; `joinEui` to zeros |
-| `{"cmd":"interval","seconds":60}` | how often to report, 15–3600 s |
-| `{"cmd":"forget"}` | drops the keys and join nonces, keeps the running total |
+| `{"cmd":"hello"}` | `eui`, `firmware`, `kind` (`lorawan-probe`), `state`, `fleet`, `maxFleet` |
+| `{"cmd":"status"}` | the fleet: size, water/power, joined, reports sent, faults by kind, clock source, signal |
+| `{"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,"epoch":…,"tzOffset":…}` | starts receiving a fleet; the running one stops |
+| `{"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"\|"power","<joinEui>"],…]}` | a chunk of devices, each chunk answered |
+| `{"cmd":"fleet-commit"}` | saves the fleet and reboots to join it |
+| `{"cmd":"lorawan","appKey":"…","devEui":"…"}` | a fleet of one water meter, reporting the board's real battery (`tools.sh provision`) |
+| `{"cmd":"interval","seconds":900}` | report interval, 60–86400 s |
+| `{"cmd":"time","epoch":…,"tzOffset":…}` | sets the clock; `tzOffset` is minutes east of UTC |
+| `{"cmd":"forget"}` | drops the fleet |
 | `{"cmd":"reboot"}` | |
 
 A refusal is `{"ok":false,"error":…,"detail":…,"faults":[{"field","message"}]}`.
-The AppKey is never sent back; `status` says only whether the board is
-provisioned.
+AppKeys are never sent back.
 
-## What it does once provisioned
+## What the fleet does
 
-- Joins by OTAA as LoRaWAN 1.0.x on **US915 sub-band 2** (channels 8–15 plus
-  65), the sub-band the NDW gateway bridge serves.
-- Every interval, sends MeterFax's `ndw-water-v1` payload on port 10: a
-  big-endian uint32 running total in decilitres, then a uint8 battery percent.
-  The total only rises and survives reboots and re-provisioning — a register
-  that restarts from zero reads as a meter running backwards.
-- Shows its state on the OLED: joining or sent, total and countdown, uplinks
-  sent and answered, the last downlink's RSSI and SNR, and the battery. Until
-  it is provisioned, the screen shows its DevEUI instead.
+- Every device joins by OTAA as LoRaWAN 1.0.x on **US915 sub-band 2**, the
+  sub-band the NDW gateway bridge serves, one at a time. A join nobody answers
+  (a device not registered yet) is retried after 2 minutes, doubling to an
+  hour.
+- Reports are spread across the interval. **Water** sends MeterFax's
+  `ndw-water-v1` on port 10: uint32 BE decilitres, uint8 battery %.
+  **Electricity** sends `ndw-power-v1` on port 11: uint32 BE watt-hours, uint16
+  BE watts. Registers start at a few years' use and only ever rise.
+- Water is drawn the way households draw it — mostly nothing overnight, the
+  morning's showers, the evening's cooking and washing, a little more at
+  weekends. Electricity is a base load with the day's use on top and now and
+  then a kettle or an oven. Each device has its own size of household.
+- About `anomalies`% of each device's reports show a fault, in episodes:
+  water leaks (a flow that never stops), bursts, a stuck register, a silent
+  meter; electricity demand spikes, stuck or silent meters. A silent meter
+  keeps counting, so the gap shows in its register when it returns.
+- The clock comes from the browser, then from the network's DeviceTimeAns,
+  and is saved so a reboot away from both keeps roughly the day.
+- Every eighth report asks for a LinkCheck; three unanswered in a row and the
+  device joins again — which is how it recovers when ChirpStack forgets it.
 
-Register the same DevEUI and AppKey in MeterFax (Devices → Add device). For
-its readings to decode as water the device must be on the ChirpStack profile
-named **`ndw-water-v1`** — MeterFax chooses its decoder by profile name.
+One report holds the radio about three seconds, so 200 devices take about ten
+minutes a round: the interval should be longer. The OLED shows the fleet,
+joined count, the device on air, reports sent and faults showing.
 
 ## Building and flashing locally
 
 ```sh
 ./tools.sh flash                         # build and write, keeping saved state
-./tools.sh status                        # what the board knows
-./tools.sh provision <appkey> [deveui]   # write its keys; it reboots and joins
+./tools.sh status                        # what the fleet is doing
+./tools.sh provision <appkey> [deveui]   # a fleet of one: the board itself
 ./tools.sh monitor
 ./tools.sh mac                           # the board's MAC and the DevEUI it makes
 ```
@@ -62,12 +79,15 @@ named **`ndw-water-v1`** — MeterFax chooses its decoder by profile name.
 
 ## Things that bite
 
-- **ChirpStack rejects a reused DevNonce.** The probe saves its join nonces
-  and keeps them for the keys they were counted under, so a reboot rejoins. A
-  board re-provisioned as a different device starts counting again. After
-  `./tools.sh erase`, or a RadioLib upgrade that changes the saved format, the
-  count restarts too, and ChirpStack refuses joins until it passes the old
-  count or the device's nonces are flushed there.
+- **ChirpStack rejects a reused DevNonce, and frames whose counter went
+  back.** Each device is a file in LittleFS with its RadioLib nonces and
+  session, saved after every join and report, so neither goes backwards.
+  Programming the same DevEUIs again keeps their files; a device dropped from
+  the fleet loses its file, and if it is added back ChirpStack refuses its
+  joins until its dev-nonces are flushed there. `./tools.sh erase` loses them
+  all.
+- **The single-device firmware's keys carry over.** A board upgraded from
+  0.1.x keeps its device as a fleet of one, with its nonces and total.
 - **The null NwkKey is deliberate.** `beginOTAA(joinEUI, devEUI, nullptr,
   appKey)` is what makes RadioLib join as 1.0.x on the AppKey alone.
 - **The battery-sense switch** (GPIO37) is active-low on some V3 revisions and
