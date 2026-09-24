@@ -275,3 +275,183 @@ jobs:
             echo "Download it from this run's artifacts to flash a bench board."
             echo "The console only offers what is in \`manifest.json\` on \`main\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # PlatformIO builds: Arduino-framework firmware, which the ESP-IDF image
+  # above cannot build. The same rules otherwise — a release only from main,
+  # -rc everywhere else, offsets checked against what the toolchain itself
+  # would flash, and the same rebase-and-push publish.
+  build-platformio:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: heltec/wifi-lora-32-v3/lorawan-probe
+            env: heltec_v3
+            build: ndw/heltec/wifi-lora-32-v3/lora/probe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          base=$(python3 -c "import json;print(json.load(open('builds/${{ matrix.build }}/build.json')).get('revision','0.0.0'))")
+          sha=$(git rev-parse --short HEAD)
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            version="${base}"
+            publish=true
+          else
+            version="${base}-rc.${{ github.run_number }}+${sha}"
+            publish=false
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ matrix.build }} as ${version}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO's platforms and libraries
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles(format('src/{0}/platformio.ini', matrix.project)) }}
+
+      - name: Build
+        working-directory: src/${{ matrix.project }}
+        env:
+          # platformio.ini turns this into the firmware's version string.
+          NDW_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Pinned in requirements.txt, like the IDF image: a toolchain that
+          # moves on its own turns an unrelated push into a different binary.
+          pip install --quiet -r requirements.txt
+          pio run -e ${{ matrix.env }}
+
+      - name: Collect the images
+        working-directory: src/${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/builds/${{ matrix.build }}"
+          build=".pio/build/${{ matrix.env }}"
+          # boot_app0 is the Arduino core's otadata image, fetched with the
+          # platform rather than built, so it is found where PlatformIO says.
+          boot_app0=$(pio project metadata -e ${{ matrix.env }} --json-output \
+            | python3 -c "import json,sys; d=json.load(sys.stdin)['${{ matrix.env }}']; print(next(f['path'] for f in d['extra']['flash_images'] if f['path'].endswith('boot_app0.bin')))")
+          cp "$build/bootloader.bin" "$out/bootloader.bin"
+          cp "$build/partitions.bin" "$out/partition-table.bin"
+          cp "$boot_app0" "$out/boot-app0.bin"
+          cp "$build/firmware.bin" "$out/app.bin"
+          ls -l "$out"/*.bin
+
+      - name: Check the offsets against what PlatformIO would use
+        working-directory: src/${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          # The same check the IDF builds make against flash_args: a declared
+          # offset that disagrees with the toolchain's writes happily and
+          # leaves a board that never boots.
+          pio project metadata -e ${{ matrix.env }} --json-output > /tmp/metadata.json
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+
+          env = "${{ matrix.env }}"
+          meta = json.load(open("/tmp/metadata.json"))[env]["extra"]
+          truth = {pathlib.Path(f["path"]).name: int(f["offset"], 16) for f in meta["flash_images"]}
+          truth["firmware.bin"] = int(meta["application_offset"], 16)
+
+          copied = {
+              "bootloader.bin": "bootloader.bin",
+              "partition-table.bin": "partitions.bin",
+              "boot-app0.bin": "boot_app0.bin",
+              "app.bin": "firmware.bin",
+          }
+          build = json.loads(pathlib.Path(os.environ["GITHUB_WORKSPACE"], "builds/${{ matrix.build }}/build.json").read_text())
+          declared = {p["path"]: p["address"] for p in build["parts"]}
+
+          bad = False
+          for name, source in copied.items():
+              want, got = truth.get(source), declared.get(name)
+              if want is None:
+                  print(f"error: PlatformIO does not flash {source}")
+                  bad = True
+              elif got != want:
+                  print(f"error: {name} declared at {got:#x}, PlatformIO uses {want:#x}")
+                  bad = True
+              else:
+                  print(f"ok: {name} at {got:#x}")
+          extra = set(truth) - set(copied.values())
+          if extra:
+              print(f"error: PlatformIO flashes images the manifest omits: {sorted(extra)}")
+              bad = True
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Record the version in the build definition
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("builds/${{ matrix.build }}/build.json")
+          doc = json.loads(p.read_text())
+          doc["revision"] = os.environ["VERSION"]
+          p.write_text(json.dumps(doc, indent=2) + "\n")
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Rebuild the manifest
+        run: python3 scripts/build-manifest.py
+
+      - name: Attach the build to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ steps.version.outputs.version }}
+          path: |
+            builds/${{ matrix.build }}/*.bin
+            manifest.json
+          retention-days: 14
+
+      - name: Publish
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard builds)" ]; then
+            echo "nothing changed"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add builds manifest.json
+          git commit -m "Publish ${{ matrix.build }} ${{ steps.version.outputs.version }}"
+          # Other jobs push in parallel; rebase onto them and regenerate the
+          # manifest rather than merging it, as the IDF job does.
+          git fetch origin main
+          if ! git rebase origin/main; then
+            git checkout --theirs manifest.json 2>/dev/null || true
+            python3 scripts/build-manifest.py
+            git add manifest.json
+            GIT_EDITOR=true git rebase --continue
+          fi
+          python3 scripts/build-manifest.py
+          if ! git diff --quiet manifest.json; then
+            git add manifest.json
+            git commit --amend --no-edit
+          fi
+          git push
+
+      - name: Say what was built
+        if: steps.version.outputs.publish != 'true'
+        run: |
+          {
+            echo "### ${{ matrix.build }}"
+            echo
+            echo "Built \`${{ steps.version.outputs.version }}\` — **not published**."
+            echo
+            echo "Download it from this run's artifacts to flash a bench board."
+          } >> "$GITHUB_STEP_SUMMARY"

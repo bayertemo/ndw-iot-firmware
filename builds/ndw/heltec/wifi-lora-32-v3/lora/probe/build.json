@@ -1,0 +1,29 @@
+{
+  "kind": "ndw/heltec/wifi-lora-32-v3/lora/probe",
+  "name": "NDW LoRaWAN probe · Heltec WiFi LoRa 32 V3",
+  "role": "sensor",
+  "description": "A LoRaWAN test device that reports like a water meter. For the Heltec WiFi LoRa 32 V3 only: its pins are that board's. Programmed with its keys over USB after flashing.",
+  "chipLabel": "ESP32-S3 · Heltec WiFi LoRa 32 V3",
+  "$comment": "chipMatch can only name the chip: esptool-js reports 'ESP32-S3', not the board around it. Any ESP32-S3 will be offered this image, and on anything but a Heltec V3 the radio and screen pins are wrong. The name and description carry the warning the regex cannot.",
+  "chipMatch": "^ESP32-S3(?!\\d)",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "address": 0
+    },
+    {
+      "path": "partition-table.bin",
+      "address": 32768
+    },
+    {
+      "path": "boot-app0.bin",
+      "address": 57344
+    },
+    {
+      "path": "app.bin",
+      "address": 65536
+    }
+  ],
+  "$comment2": "An Arduino build, not ESP-IDF: boot-app0.bin is the Arduino core's otadata image, the same 8KB of 0xff the IDF builds call ota-data-initial.bin, and needed for the same reason — the console writes with eraseAll false.",
+  "revision": "0.1.0"
+}

@@ -38,24 +38,20 @@ publishes and the console fetches against — the two cannot drift, because
 `scripts/build-manifest.py` refuses a `build.json` whose `kind` disagrees
 with where it sits.
 
-## Board projects
+## Two toolchains
 
-```
-boards/<maker>/<board>/<project>/
-```
-
-Firmware for one specific board that is **not** an NDW product image: test
-and bench tools, built and flashed locally with the tooling in their own
-directory. They sit outside `src/` on purpose — the workflow rebuilds and
-republishes everything under `src/` on any change there, and nothing here
-belongs in the manifest the console offers.
+Most builds are ESP-IDF projects under `src/<project>`, built in Espressif's
+pinned Docker image. Arduino-framework firmware is built with PlatformIO
+instead, by the workflow's `build-platformio` job, and lives under
+`src/<maker>/<board>/<project>` because it is written for one board rather
+than one chip:
 
 | | |
 |---|---|
-| `boards/heltec/wifi-lora-32-v3/lorawan-probe` | a LoRaWAN test device that reports as a water meter, for proving a gateway and the path to MeterFax |
+| `src/heltec/wifi-lora-32-v3/lorawan-probe` | a LoRaWAN test device that reports as a water meter, programmed with its keys over USB after flashing |
 
-Keys stay out of this repository here too: a board project reads its
-credentials from a git-ignored file and commits only an example of it.
+Nothing about a device is compiled into any image here. Firmware that needs
+keys takes them over USB after it is flashed.
 
 ## One build, one chip
 
