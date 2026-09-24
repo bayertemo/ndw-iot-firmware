@@ -2,14 +2,16 @@
 //
 // A test device that behaves like a fleet of meters: up to 200 LoRaWAN
 // devices over one radio, each joining by OTAA (LoRaWAN 1.0.x, US915
-// sub-band 2) and reporting on its own schedule as a water or an electricity
-// meter, with the daily rhythm real households have and the faults real
+// sub-band 2) and reporting on its own schedule as a water, electricity or
+// gas meter, with the daily rhythm real households have and the faults real
 // meters show.
 //
 //   water  port 10  uint32 BE decilitres (running total), uint8 battery %
 //                   — MeterFax's ndw-water-v1
 //   power  port 11  uint32 BE watt-hours (running total), uint16 BE watts
 //                   — MeterFax's ndw-power-v1
+//   gas    port 12  uint32 BE decilitres (running total), uint8 battery %
+//                   — MeterFax's ndw-gas-v1
 //
 // ## One image, programmed over USB
 //
@@ -23,7 +25,7 @@
 //   {"cmd":"status"}       → the fleet: size, joined, sent, faults, signal
 //   {"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,
 //    "epoch":1790000000,"tzOffset":-300}
-//   {"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"|"power",
+//   {"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"|"power"|"gas",
 //    "<joinEui>"?],…]}     → a chunk at a time, each answered
 //   {"cmd":"fleet-commit"} → saves the fleet, reboots, starts joining
 //   {"cmd":"lorawan","appKey":"…","devEui":"…"?,"joinEui":"…"?}
@@ -102,7 +104,7 @@ static const uint8_t CHECKS_MISSED = 3;
 static const uint32_t MAGIC = 0x4e445746;  // "NDWF"
 static const uint16_t VERSION = 1;
 
-enum Kind : uint8_t { WATER = 0, POWER = 1 };
+enum Kind : uint8_t { WATER = 0, POWER = 1, GAS = 2 };
 
 // A fault a meter is showing, for a stretch of its reports.
 enum Anomaly : uint8_t {
@@ -129,6 +131,11 @@ static const Fault WATER_FAULTS[] = {
 };
 static const Fault POWER_FAULTS[] = {
   {SPIKE, 0.50f, 1, 4}, {STUCK, 0.30f, 8, 40}, {SILENT, 0.20f, 2, 12},
+};
+// Gas has no burst worth simulating — a rupture is a gas main, not a meter
+// reading — so a leak, a register that stops, or a meter that goes quiet.
+static const Fault GAS_FAULTS[] = {
+  {LEAK, 0.50f, 8, 48}, {STUCK, 0.30f, 8, 40}, {SILENT, 0.20f, 2, 12},
 };
 
 // One device as it is kept in flash.
@@ -298,6 +305,16 @@ void localTime(float* hour, int* weekday) {
   *weekday = (int)(((day + 4) % 7 + 7) % 7);
 }
 
+// The day of the local year, 0 to 365, for the season gas heating follows.
+// Close enough without leap-year bookkeeping: a day's error moves a season by
+// a day. Without any clock, early April — mid-season, neither extreme.
+float dayOfYear() {
+  uint32_t e = epochNow();
+  if (!e) return 95;
+  int64_t local = (int64_t)e + (int64_t)cfg.tzOffsetMin * 60;
+  return fmodf((float)(local / 86400) , 365.2425f);
+}
+
 // ---- how meters behave ---------------------------------------------------
 
 // Relative water use through the day: near nothing overnight, the morning's
@@ -316,6 +333,25 @@ static const float POWER_HOURS[24] = {
 
 // About 350 L a day for a household, before its own scale.
 static const float WATER_LITRES_PER_DAY = 350.0f;
+
+// Gas through the day: the heating's morning run from before six, a midday
+// low with the thermostat set back, the evening's heating and cooking, and a
+// night setback that still burns a little. Relative, not a share.
+static const float GAS_HOURS[24] = {
+  0.25, 0.20, 0.20, 0.20, 0.30, 0.70, 1.00, 1.00, 0.80, 0.50, 0.35, 0.35,
+  0.40, 0.35, 0.35, 0.40, 0.55, 0.85, 1.00, 0.95, 0.85, 0.70, 0.50, 0.35,
+};
+
+// About 2.5 m³ a day across a year, before the season and the household:
+// heating makes the winter several times the summer, when only hot water and
+// cooking burn any.
+static const float GAS_LITRES_PER_DAY = 2500.0f;
+
+float gasDaySum() {
+  float s = 0;
+  for (float v : GAS_HOURS) s += v;
+  return s;
+}
 
 float waterDaySum() {
   float s = 0;
@@ -336,8 +372,11 @@ void stepAnomaly(Record& d) {
   float r = min(cfg.anomalyPct, (uint8_t)90) / 100.0f;
   if (r <= 0) return;
 
-  const Fault* faults = d.kind == WATER ? WATER_FAULTS : POWER_FAULTS;
-  size_t n = d.kind == WATER ? sizeof(WATER_FAULTS) / sizeof(Fault) : sizeof(POWER_FAULTS) / sizeof(Fault);
+  const Fault* faults = d.kind == WATER ? WATER_FAULTS : d.kind == GAS ? GAS_FAULTS : POWER_FAULTS;
+  size_t n = (d.kind == WATER   ? sizeof(WATER_FAULTS)
+              : d.kind == GAS   ? sizeof(GAS_FAULTS)
+                                : sizeof(POWER_FAULTS)) /
+             sizeof(Fault);
   float meanLen = 0;
   for (size_t i = 0; i < n; i++) meanLen += faults[i].share * (faults[i].minLen + faults[i].maxLen) / 2.0f;
   if (rnd(0, 1) >= r / (meanLen * (1 - r))) return;
@@ -372,6 +411,19 @@ void consume(Record& d, float hours) {
     if (d.anomaly == STUCK) litres = 0;
     d.reg += (uint32_t)(litres * 10.0f + 0.5f);
     // A meter's cell loses a percent every week or so.
+    if (rnd(0, 1) < hours / 168.0f && d.battery > 5) d.battery--;
+  } else if (d.kind == GAS) {
+    // Burnt, not drawn: a furnace cycling through the hour rather than draws
+    // of a few litres, so every interval in a heating hour moves the register
+    // and the spread is the cycling. The season is most of it — mid-January
+    // near its peak, mid-July near the floor, northern hemisphere.
+    float season = 1.0f + 0.8f * cosf(2.0f * PI * (dayOfYear() - 15) / 365.25f);
+    float share = GAS_HOURS[h] / gasDaySum();
+    float litres = GAS_LITRES_PER_DAY * d.scale * season * (weekend ? 1.1f : 1.0f) * share * hours * rnd(0.3f, 1.7f);
+    // A leak burns nothing and is metered all the same, night and day.
+    if (d.anomaly == LEAK) litres += rnd(0.02f, 0.3f) * 60 * hours;
+    if (d.anomaly == STUCK) litres = 0;
+    d.reg += (uint32_t)(litres * 10.0f + 0.5f);
     if (rnd(0, 1) < hours / 168.0f && d.battery > 5) d.battery--;
   } else {
     // A base load that never stops — the fridge, the router — the household's
@@ -768,7 +820,7 @@ void report(Slot& s, uint16_t i) {
   uint8_t payload[6] = {(uint8_t)(rec.reg >> 24), (uint8_t)(rec.reg >> 16), (uint8_t)(rec.reg >> 8), (uint8_t)rec.reg};
   size_t len;
   uint8_t port;
-  if (rec.kind == WATER) {
+  if (rec.kind == WATER || rec.kind == GAS) {
     // A fleet of one is this board, so it reports this board's battery.
     if (fleetSize == 1) {
       sampleBattery();
@@ -776,7 +828,7 @@ void report(Slot& s, uint16_t i) {
     }
     payload[4] = rec.battery;
     len = 5;
-    port = 10;
+    port = rec.kind == GAS ? 12 : 10;
   } else {
     payload[4] = rec.demandW >> 8;
     payload[5] = rec.demandW;
@@ -903,7 +955,7 @@ void stage(uint64_t devEui, uint64_t joinEui, const uint8_t* key, Kind kind) {
   rec.scale = rnd(0.5f, 1.6f);
   rec.battery = (uint8_t)rnd(70, 101);
   // Registers do not start at zero on real meters: a few years of use.
-  rec.reg = kind == WATER ? (uint32_t)rnd(2e5f, 2e6f) : (uint32_t)rnd(5e6f, 4e7f);
+  rec.reg = kind == WATER ? (uint32_t)rnd(2e5f, 2e6f) : kind == GAS ? (uint32_t)rnd(2e5f, 2e7f) : (uint32_t)rnd(5e6f, 4e7f);
   if (same) {
     // The keys are the same device's; only what it pretends to be changed.
     memcpy(rec.nonces, old.nonces, sizeof(rec.nonces));
@@ -958,6 +1010,7 @@ void onCommand(const String& line) {
     out["joined"] = countJoined();
     out["water"] = countKind(WATER);
     out["power"] = countKind(POWER);
+    out["gas"] = countKind(GAS);
     JsonObject faults = out["faults"].to<JsonObject>();
     for (int a = LEAK; a < ANOMALY_KINDS; a++) faults[ANOMALY_NAMES[a]] = countAnomaly((Anomaly)a);
     out["sent"] = view.sent;
@@ -1030,8 +1083,8 @@ void onCommand(const String& line) {
         refuse("invalid", which + "the JoinEUI must be 16 hex characters.", "joinEui");
         return;
       }
-      if (kind != "water" && kind != "power") {
-        refuse("invalid", which + "the kind must be water or power.", "kind");
+      if (kind != "water" && kind != "power" && kind != "gas") {
+        refuse("invalid", which + "the kind must be water, power or gas.", "kind");
         return;
       }
       for (uint16_t k = 0; k < stagingCount; k++) {
@@ -1040,7 +1093,7 @@ void onCommand(const String& line) {
           return;
         }
       }
-      stage(devEui, joinEui, key, kind == "power" ? POWER : WATER);
+      stage(devEui, joinEui, key, kind == "power" ? POWER : kind == "gas" ? GAS : WATER);
       stagingList[stagingCount++] = devEui;
     }
     draw();
@@ -1166,8 +1219,8 @@ void setup() {
     draw();
     return;
   }
-  Serial.printf("[probe] fleet of %u (%u water, %u power), %u joined, every %lus\n", fleetSize, countKind(WATER),
-                countKind(POWER), countJoined(), (unsigned long)cfg.intervalS);
+  Serial.printf("[probe] fleet of %u (%u water, %u power, %u gas), %u joined, every %lus\n", fleetSize,
+                countKind(WATER), countKind(POWER), countKind(GAS), countJoined(), (unsigned long)cfg.intervalS);
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS);
   // 1.8 V on the TCXO, as the board wires it. The frequency here is replaced

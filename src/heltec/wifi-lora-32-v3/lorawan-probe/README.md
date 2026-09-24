@@ -1,7 +1,7 @@
 # NDW LoRaWAN meter fleet — Heltec WiFi LoRa 32 V3
 
-Up to 200 simulated LoRaWAN meters on one board and one radio: water and
-electricity, each joining on its own keys and reporting on its own schedule,
+Up to 200 simulated LoRaWAN meters on one board and one radio: water,
+electricity and gas, each joining on its own keys and reporting on its own schedule,
 with a household's daily rhythm and the faults real meters show. For loading
 a gateway, ChirpStack and MeterFax with traffic that looks like a street's
 worth of meters.
@@ -27,7 +27,7 @@ The host writes one JSON command per line; every answer is a line starting
 | `{"cmd":"hello"}` | `eui`, `firmware`, `kind` (`lorawan-probe`), `state`, `fleet`, `maxFleet` |
 | `{"cmd":"status"}` | the fleet: size, water/power, joined, reports sent, faults by kind, clock source, signal |
 | `{"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,"epoch":…,"tzOffset":…}` | starts receiving a fleet; the running one stops |
-| `{"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"\|"power","<joinEui>"],…]}` | a chunk of devices, each chunk answered |
+| `{"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"\|"power"\|"gas","<joinEui>"],…]}` | a chunk of devices, each chunk answered |
 | `{"cmd":"fleet-commit"}` | saves the fleet and reboots to join it |
 | `{"cmd":"lorawan","appKey":"…","devEui":"…"}` | a fleet of one water meter, reporting the board's real battery (`tools.sh provision`) |
 | `{"cmd":"interval","seconds":900}` | report interval, 60–86400 s |
@@ -47,14 +47,18 @@ AppKeys are never sent back.
 - Reports are spread across the interval. **Water** sends MeterFax's
   `ndw-water-v1` on port 10: uint32 BE decilitres, uint8 battery %.
   **Electricity** sends `ndw-power-v1` on port 11: uint32 BE watt-hours, uint16
-  BE watts. Registers start at a few years' use and only ever rise.
+  BE watts. **Gas** sends `ndw-gas-v1` on port 12: uint32 BE decilitres, uint8
+  battery %. Registers start at a few years' use and only ever rise.
 - Water is drawn the way households draw it — mostly nothing overnight, the
   morning's showers, the evening's cooking and washing, a little more at
   weekends. Electricity is a base load with the day's use on top and now and
-  then a kettle or an oven. Each device has its own size of household.
+  then a kettle or an oven. Gas follows the heating — a morning and an evening
+  run, a night setback — and the season, several times more in January than
+  in July. Each device has its own size of household.
 - About `anomalies`% of each device's reports show a fault, in episodes:
   water leaks (a flow that never stops), bursts, a stuck register, a silent
-  meter; electricity demand spikes, stuck or silent meters. A silent meter
+  meter; electricity demand spikes, stuck or silent meters; gas leaks, stuck or
+  silent meters. A silent meter
   keeps counting, so the gap shows in its register when it returns.
 - The clock comes from the browser, then from the network's DeviceTimeAns,
   and is saved so a reboot away from both keeps roughly the day.
