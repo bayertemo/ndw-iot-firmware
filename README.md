@@ -38,6 +38,25 @@ publishes and the console fetches against — the two cannot drift, because
 `scripts/build-manifest.py` refuses a `build.json` whose `kind` disagrees
 with where it sits.
 
+## Board projects
+
+```
+boards/<maker>/<board>/<project>/
+```
+
+Firmware for one specific board that is **not** an NDW product image: test
+and bench tools, built and flashed locally with the tooling in their own
+directory. They sit outside `src/` on purpose — the workflow rebuilds and
+republishes everything under `src/` on any change there, and nothing here
+belongs in the manifest the console offers.
+
+| | |
+|---|---|
+| `boards/heltec/wifi-lora-32-v3/lorawan-probe` | a LoRaWAN test device that reports as a water meter, for proving a gateway and the path to MeterFax |
+
+Keys stay out of this repository here too: a board project reads its
+credentials from a git-ignored file and commits only an example of it.
+
 ## One build, one chip
 
 Each `build.json` targets exactly one chip family, and says so with a regex
