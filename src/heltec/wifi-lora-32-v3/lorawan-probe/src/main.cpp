@@ -525,7 +525,11 @@ String recordPath(uint64_t devEui) {
 }
 
 bool readRecord(uint64_t devEui, Record& out) {
-  File f = LittleFS.open(recordPath(devEui), "r");
+  // Checked first: opening a missing file logs an error, and a device new to
+  // the fleet has none yet.
+  String path = recordPath(devEui);
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
   if (!f) return false;
   bool ok = f.read((uint8_t*)&out, sizeof(Record)) == sizeof(Record);
   f.close();
