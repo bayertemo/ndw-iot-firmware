@@ -31,6 +31,7 @@ The host writes one JSON command per line; every answer is a line starting
 | `{"cmd":"fleet-commit"}` | saves the fleet and reboots to join it |
 | `{"cmd":"lorawan","appKey":"…","devEui":"…"}` | a fleet of one water meter, reporting the board's real battery (`tools.sh provision`) |
 | `{"cmd":"interval","seconds":900}` | report interval, 60–86400 s |
+| `{"cmd":"channel","channel":8}` | keeps the fleet already on the board to one channel, for an NDW LoRaWAN Gateway, keeping its devices; `null` frees it |
 | `{"cmd":"time","epoch":…,"tzOffset":…}` | sets the clock; `tzOffset` is minutes east of UTC |
 | `{"cmd":"forget"}` | drops the fleet |
 | `{"cmd":"reboot"}` | |

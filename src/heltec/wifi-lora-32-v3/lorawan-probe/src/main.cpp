@@ -34,6 +34,9 @@
 //   {"cmd":"lorawan","appKey":"…","devEui":"…"?,"joinEui":"…"?}
 //                          → a fleet of one water meter: the board itself
 //   {"cmd":"interval","seconds":900}
+//   {"cmd":"channel","channel":8|null}
+//                          → keeps the fleet on the board to one channel
+//                            (or frees it) without programming it again
 //   {"cmd":"time","epoch":…,"tzOffset":…}
 //   {"cmd":"forget"}       → drops the fleet
 //   {"cmd":"reboot"}
@@ -1249,6 +1252,39 @@ void onCommand(const String& line) {
     JsonDocument out;
     out["ok"] = true;
     out["interval"] = s;
+    reply(out);
+  } else if (cmd == "channel") {
+    // Keeps the fleet already on the board to one channel, or frees it: the
+    // devices and their keys stay as they are, so a fleet already imported
+    // into MeterFax need not be made again to serve an NDW LoRaWAN Gateway.
+    uint8_t ch = ALL_CHANNELS;
+    if (in["channel"].is<int>()) {
+      int v = in["channel"].as<int>();
+      if (v < 0 || v > 63) {
+        refuse("invalid", "The channel must be 0 to 63, one of US915's 125 kHz channels.", "channel");
+        return;
+      }
+      ch = (uint8_t)v;
+    } else if (!in["channel"].isNull()) {
+      refuse("invalid", "The channel is a number, or null for the whole sub-band.", "channel");
+      return;
+    }
+    if (!store.putUChar("chan", ch)) {
+      refuse("storage", "The channel could not be written to flash.");
+      return;
+    }
+    node.channel = ch;
+    node.setADR(!node.pinned());
+    Serial.printf("[probe] %s\n", node.pinned() ? ("kept to channel " + String(ch)).c_str() : "on the whole sub-band");
+    JsonDocument out;
+    out["ok"] = true;
+    if (node.pinned()) {
+      out["channel"] = node.channel;
+      out["channelMHz"] = (902300 + node.channel * 200) / 1000.0;
+      out["dr"] = node.dr;
+    } else {
+      out["channel"] = nullptr;
+    }
     reply(out);
   } else if (cmd == "time") {
     setClock(in, cfg);
