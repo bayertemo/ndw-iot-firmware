@@ -101,6 +101,22 @@ static const DataRate US915_DR[14] = {
 static const int64_t TX_PREPARE_US = 30000;
 static const int64_t TX_LATE_US = 5000;
 
+// How long a connection may take to become a websocket before it is called
+// failed and diagnosed. The websocket library reports a failed TCP or TLS
+// connection to nobody — it only logs it — so without this a gateway that
+// cannot connect says "connecting" for ever.
+static const uint32_t OPEN_TIMEOUT_MS = 20000;
+
+// How long to wait for NTP before connecting anyway. Until the clock is set
+// it reads 1970, and every certificate looks not yet valid.
+static const uint32_t CLOCK_WAIT_MS = 30000;
+
+// A failed connection is tried again after 2 s, then twice as long each time
+// up to 30 s: soon enough that a gateway is back within moments of the
+// server or the network returning, and not so often it hammers either.
+static const uint32_t RETRY_FIRST_MS = 2000;
+static const uint32_t RETRY_MAX_MS = 30000;
+
 // The trust file and a token, as bounds on what is accepted over USB.
 static const size_t TRUST_MAX = 12000;
 static const size_t TOKEN_MAX = 512;
@@ -351,7 +367,9 @@ struct {
   bool pendingMux = false;
   bool closing = false;  // a close this asked for, not one to report
   uint32_t retryAt = 0;
-  uint32_t backoffMs = 5000;
+  uint32_t openedAt = 0;  // when this socket was started, for OPEN_TIMEOUT_MS
+  uint32_t wifiAt = 0;    // when WiFi came up, for CLOCK_WAIT_MS
+  uint32_t backoffMs = RETRY_FIRST_MS;
   uint8_t session = 0;  // top byte of xtime: a downlink from an older connection is refused
   uint32_t up = 0, down = 0, late = 0;
 } server;
@@ -371,7 +389,7 @@ void linkFailed(const char* error, const String& detail) {
   server.detail = detail;
   server.configured = false;
   server.retryAt = millis() + server.backoffMs;
-  server.backoffMs = min<uint32_t>(server.backoffMs * 2, 120000);
+  server.backoffMs = min<uint32_t>(server.backoffMs * 2, RETRY_MAX_MS);
   Serial.printf("[gateway] server: %s — %s, again in %lus\n", error, detail.c_str(),
                 (unsigned long)((server.retryAt - millis()) / 1000));
 }
@@ -411,9 +429,10 @@ void diagnose(const String& host, uint16_t port, const String& path) {
 void openSocket(const String& host, uint16_t port, const String& path, bool tls) {
   closeSocket();
   server.opened = false;
-  // The library reconnects on its own by default. Its retries would hide the
-  // failure this needs to diagnose, so it is told to wait an hour and this
-  // decides when to try again.
+  server.openedAt = millis();
+  // The library's own reconnect is switched off (an hour is its "never"):
+  // it retries silently, hiding the failure this diagnoses. The retries are
+  // this firmware's — straight away, then backing off from 2 s to 30 s.
   ws.setReconnectInterval(3600000);
   ws.setExtraHeaders(cfg.token.c_str());
   if (tls) {
@@ -718,7 +737,7 @@ void onMessage(const char* text, size_t len) {
     }
     server.configured = true;
     server.state = L_CONNECTED;
-    server.backoffMs = 5000;
+    server.backoffMs = RETRY_FIRST_MS;
     Serial.printf("[gateway] connected, %s, listening on %.1f MHz SF%u\n", region.c_str(), LISTEN_MHZ, LISTEN_SF);
   } else if (type == "dnmsg") {
     onDownlink(in);
@@ -772,13 +791,25 @@ void serviceLink() {
   if (WiFi.status() != WL_CONNECTED) {
     if (server.state != L_NO_WIFI && server.state != L_UNSET) closeSocket();
     server.state = L_NO_WIFI;
+    server.wifiAt = 0;
     server.configured = false;
     return;
   }
   if (server.state == L_NO_WIFI || server.state == L_UNSET) {
-    server.backoffMs = 5000;
+    if (!server.wifiAt) server.wifiAt = millis();
+    // The clock first: TLS checks the certificate's dates against it.
+    if (time(nullptr) < 1600000000 && millis() - server.wifiAt < CLOCK_WAIT_MS) return;
+    if (time(nullptr) < 1600000000) Serial.println("[gateway] no time from NTP yet; connecting anyway");
+    server.backoffMs = RETRY_FIRST_MS;
     startDiscovery();
     return;
+  }
+  if ((server.state == L_DISCOVERING || server.state == L_CONNECTING) && !server.opened && !server.pendingMux &&
+      millis() - server.openedAt > OPEN_TIMEOUT_MS) {
+    Serial.println("[gateway] no websocket after 20s, finding out why");
+    closeSocket();
+    server.state = L_ERROR;
+    server.error = "diagnosing";
   }
   if (server.pendingMux) {
     server.pendingMux = false;
