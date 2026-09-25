@@ -26,7 +26,7 @@ The host writes one JSON command per line; every answer is a line starting
 | --- | --- |
 | `{"cmd":"hello"}` | `eui`, `firmware`, `kind` (`lorawan-probe`), `state`, `fleet`, `maxFleet` |
 | `{"cmd":"status"}` | the fleet: size, water/power/gas, joined, reports sent, devices in an anomaly (`faults.high`), clock source, signal |
-| `{"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,"epoch":…,"tzOffset":…}` | starts receiving a fleet; the running one stops |
+| `{"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,"epoch":…,"tzOffset":…,"channel":8}` | starts receiving a fleet; the running one stops. `channel` (optional) keeps every device to that one US915 channel at DR3, with ADR off, for the NDW test gateway |
 | `{"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"\|"power"\|"gas","<joinEui>"],…]}` | a chunk of devices, each chunk answered |
 | `{"cmd":"fleet-commit"}` | saves the fleet and reboots to join it |
 | `{"cmd":"lorawan","appKey":"…","devEui":"…"}` | a fleet of one water meter, reporting the board's real battery (`tools.sh provision`) |

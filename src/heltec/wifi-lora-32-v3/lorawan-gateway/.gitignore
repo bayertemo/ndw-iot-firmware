@@ -1,0 +1,3 @@
+# PlatformIO's build output and the local toolchain tools.sh installs.
+.pio/
+.venv/

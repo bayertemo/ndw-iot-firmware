@@ -289,6 +289,9 @@ jobs:
           - project: heltec/wifi-lora-32-v3/lorawan-probe
             env: heltec_v3
             build: ndw/heltec/wifi-lora-32-v3/lora/probe
+          - project: heltec/wifi-lora-32-v3/lorawan-gateway
+            env: heltec_v3
+            build: ndw/heltec/wifi-lora-32-v3/lora/gateway
 
     steps:
       - uses: actions/checkout@v4

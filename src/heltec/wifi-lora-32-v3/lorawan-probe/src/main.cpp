@@ -24,7 +24,9 @@
 //                            "lorawan-probe", the word hosts look for
 //   {"cmd":"status"}       → the fleet: size, joined, sent, anomalies, signal
 //   {"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,
-//    "epoch":1790000000,"tzOffset":-300}
+//    "epoch":1790000000,"tzOffset":-300,"channel":8?}
+//                          → channel keeps every device to that one US915
+//                            channel at DR3, for the NDW test gateway
 //   {"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"|"power"|"gas",
 //    "<joinEui>"?],…]}     → a chunk at a time, each answered; the kind is
 //                            required, the host deciding the fleet's mix
@@ -171,8 +173,114 @@ struct __attribute__((packed)) Config {
 
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_RST, PIN_BUSY, SPI);
 
+// The channel an NDW test gateway listens on, and the data rate: US915
+// channel 8, 903.9 MHz — the first of sub-band 2 — at DR3, SF7 on 125 kHz.
+// The gateway firmware listens on exactly this, since its one radio can hear
+// one channel at one spreading factor.
+static const uint8_t TEST_GATEWAY_CHANNEL = 8;
+static const uint8_t TEST_GATEWAY_DR = 3;
+static const uint8_t ALL_CHANNELS = 0xff;
+
+// A LoRaWAN node that can be kept to one channel and one data rate, for a
+// single-channel gateway.
+//
+// RadioLib has no setting for this. A US915 node picks a random channel of
+// its sub-band for every frame, and a join also picks between DR0 on eight
+// channels and DR4 on a ninth — so a gateway hearing one channel at one
+// spreading factor would miss eight frames in nine. Everything RadioLib
+// chooses from is its channel plan, which a subclass can reach: this puts
+// exactly one channel in it before every frame, uplink and join alike.
+//
+// The join is the awkward one. activateOTAA rebuilds the plan and picks a
+// channel in the same call, with no hook between, so this overrides it with
+// the library's own body (RadioLib 7.1.2, pinned in platformio.ini) plus one
+// line after createSession. A RadioLib upgrade has to re-copy it.
+class PinnedNode : public LoRaWANNode {
+ public:
+  using LoRaWANNode::LoRaWANNode;
+  using LoRaWANNode::sendReceive;
+
+  // ALL_CHANNELS for the whole sub-band, as the network plans it.
+  uint8_t channel = ALL_CHANNELS;
+  uint8_t dr = TEST_GATEWAY_DR;
+
+  bool pinned() const {
+    return channel != ALL_CHANNELS;
+  }
+
+  // The plan, reduced to the one channel. Rebuilt rather than filtered: a
+  // LinkADRReq replaces the plan with the channels it enables, and one that
+  // left ours out would leave nothing to enable.
+  void keepToOne() {
+    if (!pinned()) return;
+    LoRaWANChannel_t c = RADIOLIB_LORAWAN_CHANNEL_NONE;
+    for (int i = 0; i < RADIOLIB_LORAWAN_NUM_AVAILABLE_CHANNELS; i++) channelPlan[RADIOLIB_LORAWAN_UPLINK][i] = c;
+    c.enabled = true;
+    c.available = true;
+    c.idx = channel;
+    c.freq = band->txSpans[0].freqStart + channel * band->txSpans[0].freqStep;
+    c.drMin = band->txSpans[0].drMin;
+    c.drMax = band->txSpans[0].drMax;
+    c.dr = dr;
+    channelPlan[RADIOLIB_LORAWAN_UPLINK][0] = c;
+    channels[RADIOLIB_LORAWAN_UPLINK].dr = dr;
+  }
+
+  int16_t sendReceive(const uint8_t* dataUp, size_t lenUp, uint8_t fPort, uint8_t* dataDown, size_t* lenDown,
+                      bool isConfirmed = false, LoRaWANEvent_t* eventUp = NULL,
+                      LoRaWANEvent_t* eventDown = NULL) override {
+    keepToOne();
+    return LoRaWANNode::sendReceive(dataUp, lenUp, fPort, dataDown, lenDown, isConfirmed, eventUp, eventDown);
+  }
+
+  int16_t activateOTAA(uint8_t joinDr = RADIOLIB_LORAWAN_DATA_RATE_UNUSED,
+                       LoRaWANJoinEvent_t* joinEvent = NULL) override {
+    if (!pinned() || isActivated() || bufferNonces[RADIOLIB_LORAWAN_NONCES_ACTIVE]) {
+      return LoRaWANNode::activateOTAA(joinDr, joinEvent);
+    }
+
+    // From here, RadioLib 7.1.2's activateOTAA for a new session.
+    int16_t state = RADIOLIB_ERR_UNKNOWN;
+    if (joinEvent) {
+      joinEvent->newSession = true;
+      joinEvent->devNonce = this->devNonce;
+      joinEvent->joinNonce = this->joinNonce;
+    }
+    this->createSession(RADIOLIB_LORAWAN_MODE_OTAA, joinDr);
+    keepToOne();  // the one line that is not RadioLib's
+
+    uint8_t joinRequestMsg[RADIOLIB_LORAWAN_JOIN_REQUEST_LEN];
+    this->composeJoinRequest(joinRequestMsg);
+    state = this->selectChannels();
+    RADIOLIB_ASSERT(state);
+    state = this->setPhyProperties(&this->channels[RADIOLIB_LORAWAN_UPLINK], RADIOLIB_LORAWAN_UPLINK,
+                                   this->txPowerMax - 2 * this->txPowerSteps);
+    RADIOLIB_ASSERT(state);
+    if (this->dwellTimeUp) {
+      RadioLibTime_t toa = this->phyLayer->getTimeOnAir(RADIOLIB_LORAWAN_JOIN_REQUEST_LEN) / 1000;
+      if (toa > this->dwellTimeUp) return RADIOLIB_ERR_DWELL_TIME_EXCEEDED;
+    }
+    // RadioLib's HAL clock on this board is Arduino's; getMod() is private to it.
+    if (this->tUplink > millis()) delay(this->tUplink - millis());
+    state = this->phyLayer->transmit(joinRequestMsg, RADIOLIB_LORAWAN_JOIN_REQUEST_LEN);
+    this->rxDelayStart = millis();
+    RADIOLIB_ASSERT(state);
+    this->devNonce += 1;
+    LoRaWANNode::hton<uint16_t>(&this->bufferNonces[RADIOLIB_LORAWAN_NONCES_DEV_NONCE], this->devNonce);
+    this->lastToA = this->phyLayer->getTimeOnAir(RADIOLIB_LORAWAN_JOIN_REQUEST_LEN) / 1000;
+    this->rxDelays[1] = RADIOLIB_LORAWAN_JOIN_ACCEPT_DELAY_1_MS;
+    this->rxDelays[2] = RADIOLIB_LORAWAN_JOIN_ACCEPT_DELAY_2_MS;
+    state = receiveCommon(RADIOLIB_LORAWAN_DOWNLINK, this->channels, this->rxDelays, 2, this->rxDelayStart);
+    if (state < RADIOLIB_ERR_NONE) return state;
+    if (state == RADIOLIB_ERR_NONE) return RADIOLIB_ERR_NO_JOIN_ACCEPT;
+    state = this->processJoinAccept(joinEvent);
+    RADIOLIB_ASSERT(state);
+    return RADIOLIB_LORAWAN_NEW_SESSION;
+  }
+};
+
 // Sub-band 2, which is what the NDW gateway bridge serves.
-LoRaWANNode node(&radio, &US915, 2);
+PinnedNode node(&radio, &US915, 2);
 
 SSD1306Wire oled(0x3c, PIN_OLED_SDA, PIN_OLED_SCL, GEOMETRY_128_64);
 
@@ -189,6 +297,7 @@ const char* clockSource = "none";
 
 // A fleet being received from the host. While it is, the running fleet stops.
 bool staging = false;
+uint8_t stagingChannel = ALL_CHANNELS;
 uint64_t* stagingList = nullptr;
 uint16_t stagingExpected = 0, stagingCount = 0;
 Config stagingCfg;
@@ -940,7 +1049,9 @@ void stage(uint64_t devEui, uint64_t joinEui, const uint8_t* key, Kind kind) {
 
 bool commit(const uint64_t* euis, uint16_t count, Config& c) {
   c.count = count;
-  if (!writeList(euis, count) || !writeConfig(c)) {
+  // Its own key rather than a Config field: Config is read back whole and
+  // checked by size, so a new field would make every saved fleet unreadable.
+  if (!writeList(euis, count) || !writeConfig(c) || !store.putUChar("chan", stagingChannel)) {
     refuse("storage", "The fleet could not be written to flash.");
     return false;
   }
@@ -976,6 +1087,11 @@ void onCommand(const String& line) {
     describe(out);
     out["band"] = "US915";
     out["subBand"] = 2;
+    if (node.pinned()) {
+      out["channel"] = node.channel;
+      out["channelMHz"] = (902300 + node.channel * 200) / 1000.0;
+      out["dr"] = node.dr;
+    }
     out["interval"] = cfg.intervalS;
     out["anomalies"] = cfg.anomalyPct;
     out["joined"] = countJoined();
@@ -1019,6 +1135,16 @@ void onCommand(const String& line) {
     stagingCfg.intervalS = interval;
     stagingCfg.anomalyPct = anomalies;
     setClock(in, stagingCfg);
+    // One channel, for an NDW test gateway; absent or null for the sub-band.
+    stagingChannel = ALL_CHANNELS;
+    if (in["channel"].is<int>()) {
+      int ch = in["channel"].as<int>();
+      if (ch < 0 || ch > 63) {
+        refuse("invalid", "The channel must be 0 to 63, one of US915's 125 kHz channels.", "channel");
+        return;
+      }
+      stagingChannel = (uint8_t)ch;
+    }
     // The running fleet stops until the new one is committed, or the board
     // restarts on the old one.
     staging = true;
@@ -1193,6 +1319,15 @@ void setup() {
   }
   Serial.printf("[probe] fleet of %u (%u water, %u power, %u gas), %u joined, every %lus\n", fleetSize,
                 countKind(WATER), countKind(POWER), countKind(GAS), countJoined(), (unsigned long)cfg.intervalS);
+
+  node.channel = store.getUChar("chan", ALL_CHANNELS);
+  if (node.pinned()) {
+    // ADR off, or the network would move the fleet off the one data rate the
+    // gateway hears.
+    node.setADR(false);
+    Serial.printf("[probe] kept to channel %u (%.1f MHz) at DR%u, for a test gateway\n", node.channel,
+                  (902300 + node.channel * 200) / 1000.0, node.dr);
+  }
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS);
   // 1.8 V on the TCXO, as the board wires it. The frequency here is replaced
