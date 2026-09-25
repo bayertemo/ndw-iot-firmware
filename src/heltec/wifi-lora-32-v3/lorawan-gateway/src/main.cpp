@@ -430,10 +430,13 @@ void openSocket(const String& host, uint16_t port, const String& path, bool tls)
   closeSocket();
   server.opened = false;
   server.openedAt = millis();
-  // The library's own reconnect is switched off (an hour is its "never"):
-  // it retries silently, hiding the failure this diagnoses. The retries are
-  // this firmware's — straight away, then backing off from 2 s to 30 s.
-  ws.setReconnectInterval(3600000);
+  // The library will not connect until this long has passed since its last
+  // failure — which begin() sets to zero, so a long interval also stops the
+  // first attempt: an hour here once meant no connection for the first hour
+  // after boot. Short, so a new socket connects at once; the retries that
+  // matter are this firmware's, from 2 s backing off to 30 s, since the
+  // library is not run at all while this waits between attempts.
+  ws.setReconnectInterval(1000);
   ws.setExtraHeaders(cfg.token.c_str());
   if (tls) {
     ws.beginSslWithCA(host.c_str(), port, path.c_str(), cfg.trust.c_str(), "");
@@ -831,8 +834,10 @@ void serviceLink() {
     diagnose(host, port, path);
     return;
   }
-  if (server.state == L_ERROR && (int32_t)(millis() - server.retryAt) >= 0) {
-    startDiscovery();
+  if (server.state == L_ERROR) {
+    // Waiting out the backoff, with the library still: run, it would retry
+    // on its own schedule rather than this one.
+    if ((int32_t)(millis() - server.retryAt) >= 0) startDiscovery();
     return;
   }
   ws.loop();
