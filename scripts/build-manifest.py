@@ -139,16 +139,22 @@ def main() -> None:
     if duplicates:
         fail(f"duplicate kinds: {sorted(duplicates)}")
 
-    # Two builds of the same role claiming one chip leaves the console unable
-    # to choose, so it is caught here rather than presented as a coin flip.
+    # Two builds of the same role for one chip on one vendor's board leave the
+    # console unable to choose, so that is caught here rather than presented
+    # as a coin flip. Different vendors are different boards around the chip —
+    # a Heltec LoRa board and a bare Espressif module are both an ESP32-S3 —
+    # and the picker's names tell them apart, which is all a choice needs.
+    def vendor(b: dict[str, object]) -> str:
+        return str(b["kind"]).split("/")[1]
+
     for role in sorted(ROLES):
         same = [b for b in builds if b["role"] == role]
         for i, a in enumerate(same):
             for b in same[i + 1 :]:
-                if a["chipMatch"] == b["chipMatch"]:
+                if a["chipMatch"] == b["chipMatch"] and vendor(a) == vendor(b):
                     fail(
                         f"{a['kind']} and {b['kind']} are both '{role}' and "
-                        f"match the same chips"
+                        f"match the same chips on the same vendor's board"
                     )
 
     MANIFEST.write_text(

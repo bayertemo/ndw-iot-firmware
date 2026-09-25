@@ -94,4 +94,4 @@ python3 scripts/build-manifest.py
 
 It fails rather than publishing something the console cannot use: an invalid
 regex, two parts at one address, a `kind` that disagrees with its path, or two
-builds of the same role claiming the same chips.
+builds of the same role claiming the same chips on the same vendor's board.
