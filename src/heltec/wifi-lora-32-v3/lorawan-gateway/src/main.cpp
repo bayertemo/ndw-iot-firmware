@@ -1,4 +1,4 @@
-// NDW test gateway, for the Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262).
+// NDW LoRaWAN Gateway, for the Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262).
 //
 // A single-channel LoRaWAN gateway that speaks LoRa Basics Station to a
 // network server — MeterFax's, at wss://lns.meterfax.com — over WiFi. For a
@@ -11,7 +11,7 @@
 // spreading factor at once. This board has one SX1262, which hears one
 // channel at one spreading factor: US915 channel 8, 903.9 MHz, SF7 on
 // 125 kHz (DR3). The fleet firmware keeps to exactly that when programmed
-// for a test gateway. The router_config the server sends describes a whole
+// for an NDW LoRaWAN Gateway. The router_config the server sends describes a whole
 // sub-band; this takes the region from it and listens on its one channel.
 //
 // ## Programmed over USB
@@ -73,7 +73,7 @@ static const int PIN_OLED_SDA = 17, PIN_OLED_SCL = 18, PIN_OLED_RST = 21;
 static const int PIN_VEXT = 36;
 
 // What it listens on: US915 channel 8 at DR3, which the fleet firmware keeps
-// to when programmed for a test gateway. Change one, change both.
+// to when programmed for an NDW LoRaWAN Gateway. Change one, change both.
 static const float LISTEN_MHZ = 903.9;
 static const uint32_t LISTEN_HZ = 903900000;
 static const uint8_t LISTEN_SF = 7;
@@ -123,7 +123,7 @@ struct {
 
 String firmware() {
   String v = GATEWAY_VERSION;
-  return "ndw-lorawan-test-gateway/" + (v.length() ? v : String("dev"));
+  return "ndw-lorawan-gateway/" + (v.length() ? v : String("dev"));
 }
 
 uint64_t boardEui() {
@@ -813,7 +813,7 @@ void draw() {
   oled.clear();
   oled.setFont(ArialMT_Plain_10);
   oled.setTextAlignment(TEXT_ALIGN_LEFT);
-  oled.drawString(0, 0, "NDW test gateway");
+  oled.drawString(0, 0, "NDW LoRaWAN Gateway");
   oled.drawHorizontalLine(0, 12, 128);
   oled.drawString(0, 14, hex64(boardEui()));
   String wifi = String("WiFi ") + wifiState();

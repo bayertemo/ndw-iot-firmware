@@ -49,7 +49,7 @@ than one chip:
 | | |
 |---|---|
 | `src/heltec/wifi-lora-32-v3/lorawan-probe` | NDW LoRaWAN meter fleet: up to 200 simulated water, electricity and gas meters, programmed over USB after flashing |
-| `src/heltec/wifi-lora-32-v3/lorawan-gateway` | NDW test gateway: a single-channel LoRaWAN gateway speaking Basics Station to MeterFax over WiFi, programmed over USB after flashing |
+| `src/heltec/wifi-lora-32-v3/lorawan-gateway` | NDW LoRaWAN Gateway: a single-channel LoRaWAN gateway speaking Basics Station to MeterFax over WiFi, programmed over USB after flashing |
 
 Nothing about a device is compiled into any image here. Firmware that needs
 keys takes them over USB after it is flashed.

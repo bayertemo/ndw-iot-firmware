@@ -1,4 +1,4 @@
-# NDW test gateway — Heltec WiFi LoRa 32 V3
+# NDW LoRaWAN Gateway — Heltec WiFi LoRa 32 V3
 
 A single-channel LoRaWAN gateway on one Heltec board, connecting to a network
 server as a LoRa Basics Station over WiFi. With a second board running
@@ -13,8 +13,8 @@ pins in `src/main.cpp` are that board's.
 The SX1262 hears one channel at one spreading factor: **US915 channel 8,
 903.9 MHz, SF7 on 125 kHz (DR3)**. A real gateway hears eight channels at
 every spreading factor, so ordinary devices, which hop, are mostly missed.
-The meter fleet has a one-channel option for exactly this: programmed for a
-test gateway, every device joins and reports on channel 8 at DR3, with ADR
+The meter fleet has a one-channel option for exactly this: programmed for an
+NDW LoRaWAN Gateway, every device joins and reports on channel 8 at DR3, with ADR
 off. The two are set to the same channel in their sources; change both.
 
 Downlinks go out as the server asks: RX1 or RX2, at the frequency and data

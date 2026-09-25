@@ -26,7 +26,7 @@
 //   {"cmd":"fleet-begin","count":200,"interval":900,"anomalies":20,
 //    "epoch":1790000000,"tzOffset":-300,"channel":8?}
 //                          → channel keeps every device to that one US915
-//                            channel at DR3, for the NDW test gateway
+//                            channel at DR3, for the NDW LoRaWAN Gateway
 //   {"cmd":"fleet-add","devices":[["<devEui>","<appKey>","water"|"power"|"gas",
 //    "<joinEui>"?],…]}     → a chunk at a time, each answered; the kind is
 //                            required, the host deciding the fleet's mix
@@ -173,7 +173,7 @@ struct __attribute__((packed)) Config {
 
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_RST, PIN_BUSY, SPI);
 
-// The channel an NDW test gateway listens on, and the data rate: US915
+// The channel an NDW LoRaWAN Gateway listens on, and the data rate: US915
 // channel 8, 903.9 MHz — the first of sub-band 2 — at DR3, SF7 on 125 kHz.
 // The gateway firmware listens on exactly this, since its one radio can hear
 // one channel at one spreading factor.
@@ -1135,7 +1135,7 @@ void onCommand(const String& line) {
     stagingCfg.intervalS = interval;
     stagingCfg.anomalyPct = anomalies;
     setClock(in, stagingCfg);
-    // One channel, for an NDW test gateway; absent or null for the sub-band.
+    // One channel, for an NDW LoRaWAN Gateway; absent or null for the sub-band.
     stagingChannel = ALL_CHANNELS;
     if (in["channel"].is<int>()) {
       int ch = in["channel"].as<int>();
@@ -1325,7 +1325,7 @@ void setup() {
     // ADR off, or the network would move the fleet off the one data rate the
     // gateway hears.
     node.setADR(false);
-    Serial.printf("[probe] kept to channel %u (%.1f MHz) at DR%u, for a test gateway\n", node.channel,
+    Serial.printf("[probe] kept to channel %u (%.1f MHz) at DR%u, for an NDW LoRaWAN Gateway\n", node.channel,
                   (902300 + node.channel * 200) / 1000.0, node.dr);
   }
 
