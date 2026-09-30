@@ -592,7 +592,12 @@ void onCommand(const std::string& line) {
     JsonDocument out;
     out["ok"] = true;
     JsonArray nets = out["networks"].to<JsonArray>();
-    for (const hal::WifiNetwork& n : net->scan()) {
+    // A radio sharing the antenna stands aside: a WiFi scan dwells on every
+    // channel, and against a BLE scan most of that time it heard nothing.
+    radio->pause(true);
+    std::vector<hal::WifiNetwork> found = net->scan();
+    radio->pause(false);
+    for (const hal::WifiNetwork& n : found) {
       JsonObject o = nets.add<JsonObject>();
       o["ssid"] = n.ssid;
       o["rssi"] = n.rssi;

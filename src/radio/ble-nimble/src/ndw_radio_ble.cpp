@@ -96,6 +96,19 @@ class Catcher : public NimBLEAdvertisedDeviceCallbacks {
 };
 Catcher catcher;
 
+// Stops and restarts the scan without NimBLE-Arduino's stop() and a fresh
+// start(), both of which clear its results list from this task while
+// NimBLE's own may still be delivering one — the race that hung a fleet that
+// stopped and started around every uplink. The host call is safe from any
+// task, and a continued start clears nothing; with no results kept, there is
+// nothing to clear.
+void cancelScan() { ble_gap_disc_cancel(); }
+
+void resumeScan() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (!scan->isScanning()) scan->start(0, nullptr, true);
+}
+
 void startScanning(uint8_t format, uint16_t intervalMs, uint16_t windowMs) {
   if (!catcher.queue) catcher.queue = xQueueCreate(32, sizeof(Caught));
   catcher.format = format;
@@ -114,13 +127,14 @@ void startScanning(uint8_t format, uint16_t intervalMs, uint16_t windowMs) {
 
 // ---- an end device ------------------------------------------------------------
 
-// A device scans from begin() on and never stops: stopping NimBLE's scan
-// frees the results its own task may still be delivering, and a fleet that
-// stopped and started it around every uplink hung within minutes. A frame
-// heard outside a receive window is simply dropped when the next one opens.
+// A device scans only while it listens: scanning while it advertises takes
+// the one radio from its own uplinks, and a gateway hears almost none of
+// them. So the scan is set up once, and cancelled and resumed around each
+// receive window (cancelScan, resumeScan).
 bool BleEndDevice::begin() {
   startBle();
   startScanning(ble::FORMAT_DOWNLINK, DEVICE_SCAN_MS, DEVICE_SCAN_MS);
+  cancelScan();
   return true;
 }
 
@@ -142,7 +156,7 @@ size_t BleEndDevice::receive(const RxWindows& w, const Accept& accept, uint8_t* 
   // Anything caught before the uplink was sent is not its answer.
   while (xQueueReceive(catcher.queue, &c, 0) == pdTRUE) {
   }
-  if (!NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(0, nullptr, false);
+  resumeScan();
   size_t got = 0;
   while (!got && esp_timer_get_time() < until) {
     if (xQueueReceive(catcher.queue, &c, pdMS_TO_TICKS(20)) != pdTRUE) continue;
@@ -153,6 +167,7 @@ size_t BleEndDevice::receive(const RxWindows& w, const Accept& accept, uint8_t* 
     info.snr = 0;
     got = c.len;
   }
+  cancelScan();
   return got;
 }
 
@@ -229,8 +244,8 @@ bool BleGateway::heard(Heard& out) {
     return true;
   }
   // The scan stops itself now and then (a controller reset, a WiFi scan);
-  // it is started again rather than left off.
-  if (!NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(0, nullptr, false);
+  // it is started again rather than left off, unless it was paused.
+  if (!paused_) resumeScan();
   return false;
 }
 
@@ -272,6 +287,15 @@ bool BleGateway::service(DownlinkOutcome& done) {
     return false;
   }
   return false;
+}
+
+void BleGateway::pause(bool paused) {
+  paused_ = paused;
+  if (paused) {
+    cancelScan();
+  } else {
+    resumeScan();
+  }
 }
 
 void BleGateway::describe(JsonObject out) {

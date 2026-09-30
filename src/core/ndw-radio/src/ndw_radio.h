@@ -118,6 +118,10 @@ class GatewayRadio {
   virtual uint8_t reportDr() = 0;
   // For the log line on connecting: "903.9 MHz SF7", "Bluetooth LE".
   virtual const char* listening() = 0;
+  // Stops listening for a while, and starts again: for a radio that shares
+  // its antenna with WiFi, which a WiFi scan needs to itself. A radio of its
+  // own ignores it.
+  virtual void pause(bool paused) { (void)paused; }
 };
 
 }  // namespace radio

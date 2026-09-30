@@ -44,6 +44,10 @@ class BleGateway : public GatewayRadio {
   uint32_t reportHz() override { return 903900000; }
   uint8_t reportDr() override { return 3; }
   const char* listening() override { return "Bluetooth LE"; }
+  void pause(bool paused) override;
+
+ private:
+  bool paused_ = false;
 };
 
 }  // namespace radio
