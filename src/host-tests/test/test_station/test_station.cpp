@@ -199,14 +199,15 @@ void test_forwards_a_frame_where_the_radio_reports_it(void) {
 
 void test_hands_a_downlink_to_the_radio_with_its_window(void) {
   uint64_t xtime = (uint64_t)0x43 << 56 | 123456789;
-  net.deliver("{\"msgtype\":\"dnmsg\",\"DevEui\":\"02-a1-b2-c3-d4-e5-f6-07\",\"dC\":0,\"diid\":7,"
+  net.deliver("{\"msgtype\":\"dnmsg\",\"DevEui\":\"02-a1-b2-c3-d4-e5-f6-07\",\"dC\":0,\"diid\":3740372393,"
               "\"pdu\":\"6004030201\",\"RxDelay\":5,\"RX1DR\":13,\"RX1Freq\":923300000,"
               "\"RX2DR\":8,\"RX2Freq\":923300000,\"xtime\":" +
               std::to_string(xtime) + "}");
   TEST_ASSERT_EQUAL_UINT(1, gw.queued.size());
   const radio::DownlinkRequest& d = gw.queued.back();
   TEST_ASSERT_EQUAL_UINT(5, d.len);
-  TEST_ASSERT_EQUAL_UINT32(7, d.diid);
+  // Past a signed int, as ChirpStack's ids are: read as one it was 0.
+  TEST_ASSERT_EQUAL_UINT32(3740372393u, d.diid);
   TEST_ASSERT_EQUAL_INT(5, d.rxDelayS);
   TEST_ASSERT_EQUAL_UINT64(123456789, d.uplinkUs);
   TEST_ASSERT_EQUAL_INT(13, d.dr[0]);

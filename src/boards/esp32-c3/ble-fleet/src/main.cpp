@@ -35,6 +35,8 @@ void setup() {
   if (!store.begin()) esp.console.writeLine("[fleet] the fleet NVS partition did not open");
   ble.begin();
   fleet::begin(IDENTITY, esp.hal, store, ble);
+  // A hang costs a reboot, not a board that goes quiet.
+  hal::startWatchdog(30);
 }
 
 void loop() { fleet::loop(); }

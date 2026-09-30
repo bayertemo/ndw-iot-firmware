@@ -1,6 +1,7 @@
 #include "ndw_hal_esp32.h"
 
 #include <esp_mac.h>
+#include <esp_task_wdt.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <nvs.h>
@@ -88,6 +89,11 @@ uint64_t Esp32Board::eui() {
 }
 
 void Esp32Board::reboot() { ESP.restart(); }
+
+void startWatchdog(uint32_t seconds) {
+  esp_task_wdt_init(seconds, true);
+  enableLoopWDT();
+}
 
 }  // namespace hal
 }  // namespace ndw

@@ -39,6 +39,8 @@ void setup() {
   net.begin();
   ble.begin();
   station::begin(IDENTITY, esp.hal, net, settings, ble);
+  // A hang costs a reboot, not a board that goes quiet.
+  hal::startWatchdog(60);
 }
 
 void loop() {

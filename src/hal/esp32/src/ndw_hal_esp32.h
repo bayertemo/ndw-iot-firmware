@@ -69,6 +69,12 @@ class Esp32Board : public Board {
   void reboot() override;
 };
 
+// Restarts the board when loop() has not come round for `seconds`: a hang,
+// wherever it is, costs a reboot rather than the fleet going quiet until
+// somebody power-cycles it. Longer than the longest a loop() may take — a
+// join's receive windows are seven seconds.
+void startWatchdog(uint32_t seconds);
+
 // Everything above, made once.
 struct Esp32 {
   Esp32Clock clock;

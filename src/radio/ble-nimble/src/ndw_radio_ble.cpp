@@ -114,8 +114,13 @@ void startScanning(uint8_t format, uint16_t intervalMs, uint16_t windowMs) {
 
 // ---- an end device ------------------------------------------------------------
 
+// A device scans from begin() on and never stops: stopping NimBLE's scan
+// frees the results its own task may still be delivering, and a fleet that
+// stopped and started it around every uplink hung within minutes. A frame
+// heard outside a receive window is simply dropped when the next one opens.
 bool BleEndDevice::begin() {
   startBle();
+  startScanning(ble::FORMAT_DOWNLINK, DEVICE_SCAN_MS, DEVICE_SCAN_MS);
   return true;
 }
 
@@ -134,8 +139,10 @@ size_t BleEndDevice::receive(const RxWindows& w, const Accept& accept, uint8_t* 
   // advertising began: the gateway may have heard the first copy.
   int64_t until = (int64_t)txStartUs_ + (int64_t)w.rxDelayS * 1000000 + LISTEN_AFTER_RX1_US;
   Caught c;
-  if (catcher.queue) xQueueReset(catcher.queue);
-  startScanning(ble::FORMAT_DOWNLINK, DEVICE_SCAN_MS, DEVICE_SCAN_MS);
+  // Anything caught before the uplink was sent is not its answer.
+  while (xQueueReceive(catcher.queue, &c, 0) == pdTRUE) {
+  }
+  if (!NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(0, nullptr, false);
   size_t got = 0;
   while (!got && esp_timer_get_time() < until) {
     if (xQueueReceive(catcher.queue, &c, pdMS_TO_TICKS(20)) != pdTRUE) continue;
@@ -146,7 +153,6 @@ size_t BleEndDevice::receive(const RxWindows& w, const Accept& accept, uint8_t* 
     info.snr = 0;
     got = c.len;
   }
-  NimBLEDevice::getScan()->stop();
   return got;
 }
 

@@ -330,7 +330,9 @@ void onDownlink(JsonDocument& in) {
     return;
   }
   if (!text::unhex(in["pdu"] | "", d.pdu, sizeof(d.pdu), d.len)) return;
-  d.diid = in["diid"] | 0;
+  // Unsigned and 32 bits: ChirpStack's ids run past what a signed int holds,
+  // and read as one they came back 0, acknowledging nothing.
+  d.diid = in["diid"].as<uint32_t>();
   d.devEui = in["DevEui"] | "";
   d.uplinkUs = d.xtime & 0xffffffffffffULL;
   d.rxDelayS = in["RxDelay"] | 1;

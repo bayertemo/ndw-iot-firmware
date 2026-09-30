@@ -163,6 +163,8 @@ void setup() {
   lora.begin();
 
   fleet::begin(IDENTITY, H, store, lora);
+  // A hang costs a reboot, not a board that goes quiet.
+  hal::startWatchdog(30);
   draw();
 }
 

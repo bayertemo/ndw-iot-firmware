@@ -25,5 +25,5 @@
     }
   ],
   "$comment2": "An Arduino build, not ESP-IDF: boot-app0.bin is the Arduino core's otadata image, the same 8KB of 0xff the IDF builds call ota-data-initial.bin, and needed for the same reason \u2014 the console writes with eraseAll false.",
-  "revision": "0.2.0"
+  "revision": "0.2.1"
 }

@@ -101,6 +101,8 @@ void setup() {
   lora.begin();
 
   station::begin(IDENTITY, esp.hal, net, settings, lora);
+  // A hang costs a reboot, not a board that goes quiet.
+  hal::startWatchdog(60);
   draw();
 }
 
