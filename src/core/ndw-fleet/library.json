@@ -1,0 +1,14 @@
+{
+  "name": "ndw-fleet",
+  "version": "0.6.0",
+  "description": "A fleet of simulated LoRaWAN meters on one board, whatever the radio and the hardware: OTAA, Class A, MAC commands, and the #NDW host protocol that programs it.",
+  "dependencies": [
+    { "name": "ArduinoJson", "owner": "bblanchon", "version": "7.2.1" },
+    { "name": "ndw-hal" },
+    { "name": "ndw-radio" },
+    { "name": "ndw-lorawan" },
+    { "name": "ndw-meters" }
+  ],
+  "frameworks": "*",
+  "platforms": "*"
+}

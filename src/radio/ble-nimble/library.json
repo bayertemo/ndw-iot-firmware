@@ -1,0 +1,17 @@
+{
+  "name": "ndw-radio-ble",
+  "version": "0.1.0",
+  "description": "NDW's BLE radio: LoRaWAN frames in BLE 5 extended advertisements, for an end device and a gateway, over NimBLE. Needs -DCONFIG_BT_NIMBLE_EXT_ADV=1 in the board's build_flags, which NimBLE itself must be compiled with.",
+  "dependencies": [
+    {
+      "name": "ndw-radio"
+    },
+    {
+      "name": "NimBLE-Arduino",
+      "owner": "h2zero",
+      "version": "1.4.3"
+    }
+  ],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

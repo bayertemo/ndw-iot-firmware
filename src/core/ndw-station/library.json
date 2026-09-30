@@ -1,0 +1,12 @@
+{
+  "name": "ndw-station",
+  "version": "0.2.0",
+  "description": "A LoRa Basics Station gateway on any radio and any hardware: the server link, settings and the #NDW host protocol.",
+  "dependencies": [
+    { "name": "ArduinoJson", "owner": "bblanchon", "version": "7.2.1" },
+    { "name": "ndw-hal" },
+    { "name": "ndw-radio" }
+  ],
+  "frameworks": "*",
+  "platforms": "*"
+}

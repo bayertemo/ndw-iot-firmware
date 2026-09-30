@@ -4,10 +4,6 @@
 __pycache__/
 *.pyc
 
-# ESP-IDF build output. The .bin files that matter are copied into builds/ by
-# the workflow and committed there; everything else here is regenerable.
-src/*/build/
-src/*/sdkconfig
-src/*/sdkconfig.old
-src/*/managed_components/
-src/*/dependencies.lock
+# PlatformIO's build output, wherever a project is. The .bin files that
+# matter are copied into builds/ by the workflow and committed there.
+.pio/

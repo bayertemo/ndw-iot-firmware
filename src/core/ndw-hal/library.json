@@ -1,0 +1,7 @@
+{
+  "name": "ndw-hal",
+  "version": "0.1.0",
+  "description": "What NDW firmware needs from its hardware: clock, RNG, storage, console, board, and a gateway's network. Interfaces only.",
+  "frameworks": "*",
+  "platforms": "*"
+}

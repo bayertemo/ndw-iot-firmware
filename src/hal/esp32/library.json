@@ -1,0 +1,8 @@
+{
+  "name": "ndw-hal-esp32",
+  "version": "0.1.0",
+  "description": "NDW's hardware layer on an ESP32 over Arduino-ESP32: clock, RNG, NVS, USB serial, board EUI.",
+  "dependencies": [{ "name": "ndw-hal" }],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

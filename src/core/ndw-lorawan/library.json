@@ -1,0 +1,8 @@
+{
+  "name": "ndw-lorawan",
+  "version": "0.2.0",
+  "description": "LoRaWAN 1.0.3 Class A without a radio: join, session keys, data frames both ways, MAC commands.",
+  "dependencies": [{ "name": "RadioLib", "owner": "jgromes", "version": "7.1.2" }],
+  "frameworks": "*",
+  "platforms": "*"
+}

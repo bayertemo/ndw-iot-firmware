@@ -1,0 +1,8 @@
+{
+  "name": "ndw-radio",
+  "version": "0.1.0",
+  "description": "What NDW's LoRaWAN core needs from a radio, an end device's and a gateway's. Interfaces only.",
+  "dependencies": [{ "name": "ArduinoJson", "owner": "bblanchon", "version": "7.2.1" }],
+  "frameworks": "*",
+  "platforms": "*"
+}

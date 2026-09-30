@@ -32,24 +32,61 @@ builds/ndw/<vendor>/<family>/<variant>/<radio>/<role>/
     app.bin             /
 ```
 
-So `builds/ndw/espressif/esp32/c3/bl/router/` is the BLE router for the
-ESP32-C3. That path is also the build's `kind`, which is what the manifest
-publishes and the console fetches against — the two cannot drift, because
-`scripts/build-manifest.py` refuses a `build.json` whose `kind` disagrees
-with where it sits.
+So `builds/ndw/espressif/esp32/c3/bl/lorawan-gateway/` is the NDW BLE Gateway
+for the ESP32-C3. That path is also the build's `kind`, which is what the
+manifest publishes and the console fetches against — the two cannot drift,
+because `scripts/build-manifest.py` refuses a `build.json` whose `kind`
+disagrees with where it sits.
 
-## Two toolchains
+## Three layers
 
-Most builds are ESP-IDF projects under `src/<project>`, built in Espressif's
-pinned Docker image. Arduino-framework firmware is built with PlatformIO
-instead, by the workflow's `build-platformio` job, and lives under
-`src/<maker>/<board>/<project>` because it is written for one board rather
-than one chip:
+The source is split by what changes independently:
+
+```
+src/
+  core/        what a device is, on any hardware and any radio — platform-free C++
+  hal/         what it runs on: the hardware layer, ESP32 for now
+  radio/       how it talks: LoRa or Bluetooth
+  boards/      the builds: a board picks one hardware layer and one radio
+  host-tests/  the core on the host
+```
+
+| Layer | Library | |
+|---|---|---|
+| core | `ndw-lorawan` | LoRaWAN 1.0.3 Class A without a radio: join, session keys, data frames both ways, MAC commands |
+| core | `ndw-meters` | How the simulated meters behave, and their payloads on ports 10, 11 and 12 |
+| core | `ndw-fleet` | A fleet of up to 200 simulated meters on one board, OTAA and Class A, and the `#NDW` protocol that programs it |
+| core | `ndw-station` | A LoRa Basics Station gateway: the server link, settings, and the `#NDW` protocol that programs it |
+| core | `ndw-hal`, `ndw-radio` | The interfaces the core is written against: clock, RNG, store, console, board, network; an end device's radio and a gateway's |
+| hal | `ndw-hal-esp32`, `ndw-hal-esp32-net` | Those interfaces on an ESP32 over Arduino-ESP32; the network half only for gateways |
+| radio | `ndw-radio-lora` | US915 through an SX1262: an end device's Class A windows to the microsecond, and a single-channel gateway |
+| radio | `ndw-radio-ble` | LoRaWAN frames in BLE 5 extended advertisements, both ways, over NimBLE |
+
+The LoRaWAN stack is the same above both radios, so a meter behaves the same
+over LoRa and over Bluetooth: it joins, reports, asks the time, checks its
+link and answers MAC commands. Another MCU is a new `hal/` directory; another
+radio a new `radio/` one; neither touches the core.
+
+The builds, each a PlatformIO project finding the layers through its
+`lib_extra_dirs`:
 
 | | |
 |---|---|
-| `src/heltec/wifi-lora-32-v3/lorawan-probe` | NDW LoRaWAN meter fleet: up to 200 simulated water, electricity and gas meters, programmed over USB after flashing |
-| `src/heltec/wifi-lora-32-v3/lorawan-gateway` | NDW LoRaWAN Gateway: a single-channel LoRaWAN gateway speaking Basics Station to MeterFax over WiFi, programmed over USB after flashing |
+| `src/boards/heltec-wifi-lora-32-v3/lora-fleet` | NDW LoRaWAN meter fleet: `ndw-fleet` on the Heltec's SX1262, with its screen and battery |
+| `src/boards/heltec-wifi-lora-32-v3/lora-gateway` | NDW LoRaWAN Gateway: `ndw-station` on the Heltec's SX1262, one channel |
+| `src/boards/esp32-c3/ble-fleet` | NDW BLE meter fleet: `ndw-fleet` over Bluetooth, any 4MB ESP32-C3 |
+| `src/boards/esp32-c3/ble-gateway` | NDW BLE Gateway: `ndw-station` over Bluetooth, any 4MB ESP32-C3 |
+
+`pio test` in `src/host-tests` runs the core on the host: the LoRaWAN stack
+against frames made by `lora-packet`, an independent implementation, and the
+fleet and gateway engines against a fake radio, network and hardware. CI runs
+it before any board is built.
+
+The C3 builds need Espressif's RISC-V toolchain, which PlatformIO ships for
+macOS as an Intel binary only: on Apple silicon, build in a container
+(`docker run --rm -v "$PWD":/repo -w /repo/src/boards/esp32-c3/ble-fleet
+python:3.12-slim sh -c 'pip install platformio==6.2.0 && pio run -e esp32c3'`)
+or install Rosetta.
 
 Nothing about a device is compiled into any image here. Firmware that needs
 keys takes them over USB after it is flashed.

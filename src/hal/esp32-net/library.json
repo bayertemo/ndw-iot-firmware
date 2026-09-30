@@ -1,0 +1,11 @@
+{
+  "name": "ndw-hal-esp32-net",
+  "version": "0.1.0",
+  "description": "A gateway's network on an ESP32: WiFi, NTP, a websocket and HTTPS diagnosis.",
+  "dependencies": [
+    { "name": "ndw-hal" },
+    { "name": "WebSockets", "owner": "links2004", "version": "2.6.1" }
+  ],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

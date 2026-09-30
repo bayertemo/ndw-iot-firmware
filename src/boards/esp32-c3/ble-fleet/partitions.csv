@@ -1,0 +1,11 @@
+# A 4MB ESP32-C3 with one app slot and "fleet": the NVS partition the meter
+# fleet lives in, as on the Heltec fleet. Nothing here updates over the air,
+# so there is no second app slot; otadata stays at 0xe000, where the flasher
+# writes boot-app0.bin, so the parts every Arduino build flashes are the same.
+#
+# Name,   Type, SubType,  Offset,   Size,    Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x300000,
+fleet,    data, nvs,      0x310000, 0x80000,
+coredump, data, coredump, 0x390000, 0x10000,

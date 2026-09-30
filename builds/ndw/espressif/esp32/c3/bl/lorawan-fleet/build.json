@@ -1,0 +1,28 @@
+{
+  "kind": "ndw/espressif/esp32/c3/bl/lorawan-fleet",
+  "name": "NDW BLE meter fleet \u00b7 ESP32-C3",
+  "role": "sensor",
+  "description": "Up to 200 simulated water, electricity and gas meters, each a LoRaWAN Class A device joining by OTAA, whose frames go over Bluetooth to an NDW BLE Gateway nearby \u2014 the NDW LoRaWAN meter fleet with BLE for its radio. Any ESP32-C3 with 4MB of flash. The fleet's keys are programmed over USB after flashing, from flash.meterfax.com.",
+  "chipLabel": "ESP32-C3",
+  "chipMatch": "^ESP32-C3(?!\\d)",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "address": 0
+    },
+    {
+      "path": "partition-table.bin",
+      "address": 32768
+    },
+    {
+      "path": "boot-app0.bin",
+      "address": 57344
+    },
+    {
+      "path": "app.bin",
+      "address": 65536
+    }
+  ],
+  "$comment2": "An Arduino build, not ESP-IDF: boot-app0.bin is the Arduino core's otadata image, the same 8KB of 0xff the IDF builds call ota-data-initial.bin, and needed for the same reason \u2014 the console writes with eraseAll false.",
+  "revision": "0.1.0"
+}

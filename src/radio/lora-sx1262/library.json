@@ -1,0 +1,11 @@
+{
+  "name": "ndw-radio-lora",
+  "version": "0.1.0",
+  "description": "NDW's LoRa radio: US915 through an SX1262, for an end device (Class A windows) and a single-channel gateway, over RadioLib's PHY.",
+  "dependencies": [
+    { "name": "ndw-radio" },
+    { "name": "RadioLib", "owner": "jgromes", "version": "7.1.2" }
+  ],
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

@@ -1,0 +1,10 @@
+# A 4MB ESP32-C3 with one app slot as large as it fits: WiFi, TLS, the
+# websocket and NimBLE together outgrow the default layout's 1.25MB slots.
+# Nothing here updates over the air, so there is no second app slot;
+# otadata stays at 0xe000, where the flasher writes boot-app0.bin.
+#
+# Name,   Type, SubType,  Offset,   Size,    Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x3E0000,
+coredump, data, coredump, 0x3F0000, 0x10000,

@@ -1,0 +1,28 @@
+{
+  "kind": "ndw/espressif/esp32/c3/bl/lorawan-gateway",
+  "name": "NDW BLE Gateway \u00b7 ESP32-C3",
+  "role": "gateway",
+  "description": "A LoRaWAN gateway whose radio is Bluetooth LE: it hears the frames NDW BLE meter fleet advertises, forwards them to MeterFax as a LoRa Basics Station over WiFi, and advertises the network's downlinks back into the meters' receive windows. Any ESP32-C3 with 4MB of flash. Its WiFi, server, trust file and token are programmed over USB after flashing, from flash.meterfax.com.",
+  "chipLabel": "ESP32-C3",
+  "chipMatch": "^ESP32-C3(?!\\d)",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "address": 0
+    },
+    {
+      "path": "partition-table.bin",
+      "address": 32768
+    },
+    {
+      "path": "boot-app0.bin",
+      "address": 57344
+    },
+    {
+      "path": "app.bin",
+      "address": 65536
+    }
+  ],
+  "$comment2": "An Arduino build, not ESP-IDF: boot-app0.bin is the Arduino core's otadata image, the same 8KB of 0xff the IDF builds call ota-data-initial.bin, and needed for the same reason \u2014 the console writes with eraseAll false.",
+  "revision": "0.1.0"
+}

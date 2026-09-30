@@ -1,0 +1,7 @@
+{
+  "name": "ndw-meters",
+  "version": "0.1.0",
+  "description": "How NDW's simulated water, electricity and gas meters behave, and the payloads MeterFax's NDW Simulator codec reads.",
+  "frameworks": "*",
+  "platforms": "*"
+}
