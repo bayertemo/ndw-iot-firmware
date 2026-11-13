@@ -82,53 +82,13 @@ against frames made by `lora-packet`, an independent implementation, and the
 fleet and gateway engines against a fake radio, network and hardware. CI runs
 it before any board is built.
 
-The C3 builds need Espressif's RISC-V toolchain, which PlatformIO ships for
-macOS as an Intel binary only: on Apple silicon, build in a container
-(`docker run --rm -v "$PWD":/repo -w /repo/src/boards/esp32-c3/ble-fleet
-python:3.12-slim sh -c 'pip install platformio==6.2.0 && pio run -e esp32c3'`)
-or install Rosetta.
+The C3 builds need Espressif's RISC-V toolchain, which PlatformIO ships for macOS as an Intel binary only; see `AGENTS.md`.
 
 Nothing about a device is compiled into any image here. Firmware that needs
 keys takes them over USB after it is flashed.
 
-## One build, one chip
+## Behavior
 
-Each `build.json` targets exactly one chip family, and says so with a regex
-tested against what esptool-js reports after connecting:
+What the firmware, the boards and the manifest do is specified in `openspec/specs/` (`firmware-publishing` for the manifest, the one-chip-per-build rule and CI; `lorawan-stack`, `meter-simulation`, `meter-fleet`, `lorawan-gateway`, `ble-transport` for the firmware). Wanted but unbuilt work is in `openspec/changes/`. Working rules are in `AGENTS.md`.
 
-```json
-{
-  "chipMatch": "^ESP32-C3(?!\\d)",
-  "parts": [{ "path": "bootloader.bin", "address": 0 }]
-}
-```
-
-The split is not bureaucracy. The bootloader offset differs by family —
-`0x1000` on the original ESP32, `0x0` on the C3 and S3 — so one image cannot
-serve both, and a wrong offset leaves a board that does not boot until it is
-reflashed. The `(?!\d)` matters too: without it `^ESP32-C3` also matches an
-ESP32-C61.
-
-Adding a chip means adding a directory, not widening a regex.
-
-## The manifest
-
-`manifest.json` is generated. Edit `builds/**/build.json` and let the
-workflow rebuild it; a hand edit is overwritten by the next push.
-
-For each part it records the size and SHA-256 of the committed binary, so the
-console can check what it received before writing anything — a truncated
-download is otherwise discovered as an unbootable board. A build whose
-binaries are missing is published with `"published": false` and listed in the
-picker as unavailable, which is the state every build is in until real
-firmware exists.
-
-Run it locally with:
-
-```sh
-python3 scripts/build-manifest.py
-```
-
-It fails rather than publishing something the console cannot use: an invalid
-regex, two parts at one address, a `kind` that disagrees with its path, or two
-builds of the same role claiming the same chips on the same vendor's board.
+`manifest.json` is generated: run `python3 scripts/build-manifest.py`; a hand edit is overwritten by the next push.
