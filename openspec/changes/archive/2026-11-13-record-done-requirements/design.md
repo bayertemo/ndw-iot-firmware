@@ -1,0 +1,1 @@
+Proof is the host tests under `src/host-tests/test` (`pio test -e native`) where the core is involved, and file and line where a scenario needs hardware (radio, NVS, watchdog) and so cannot run on the host. Those are marked `proved:` with the line, not claimed as tested.
