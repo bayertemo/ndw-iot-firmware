@@ -1,0 +1,24 @@
+schema: spec-driven
+
+context: |
+  Specs say what the firmware and its release pipeline do, in plain words, for a reader who has not seen the code: requirements with scenarios, nothing the code does not prove.
+  US spelling. The product's words: meter fleet, gateway, board, flasher, build, manifest. Technical names (LoRaWAN, Basics Station, NimBLE, NVS, `#NDW` commands) stay as in code.
+  AGENTS.md is the source of how we work; OpenSpec holds what the firmware, the boards and the manifest do.
+  Work in other repos (meterfax-web, meterfax-api, meterfax-flash, meterfax-chirpstack) is named in a change's design, not specified here. This repo is the firmware and its published builds.
+  No secrets, tokens, keys or real addresses in any artifact.
+
+rules:
+  proposal:
+    - State the behavior change and what is out of scope.
+    - Name the capabilities it touches.
+    - Mark a parked change (do not build until asked) in the first lines.
+  specs:
+    - Keep every requirement under 500 characters and give it at least one scenario.
+    - "Under each scenario put a proof note: <!-- proved: … -->, <!-- proved (unit): <file> --> or <!-- unproved -->."
+    - "Above each proof note put a TEST line naming the test file and the test's name that proves the scenario (host tests are under src/host-tests/test)."
+    - In a baseline spec describe what the code does today; in a change delta describe the intended behavior. A suspected bug goes to a findings file, never into a spec.
+    - Use the product's words in titles and prose; technical names (commands, fields) stay as in code.
+    - Use US spelling.
+  tasks:
+    - Keep tasks small.
+    - Tick each task the moment it is done.
